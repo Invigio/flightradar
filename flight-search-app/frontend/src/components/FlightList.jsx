@@ -16,9 +16,7 @@ export default function FlightList() {
   const [displayCount, setDisplayCount] = useState(20); // Ile lotów pokazać
 
   // Reset paginacji gdy zmienia się lista lotów
-  useEffect(() => {
-    setDisplayCount(20);
-  }, [flights]);
+  // (moved below to depend on filtered API-only set `apiOnlyFlightsRaw`)
 
   const handleLoadMore = () => {
     setDisplayCount(prev => prev + 20);
@@ -82,20 +80,36 @@ export default function FlightList() {
   };
 
   // ⚠️ WSZYSTKIE HOOKI MUSZĄ BYĆ NA GÓRZE - przed jakimikolwiek warunkami early return!
-  // Sprawdź czy to round-trip combinations (mają outbound/inbound)
-  const isRoundTrip = flights.length > 0 && flights[0]?.outbound && flights[0]?.inbound;
+  // Filtruj wyniki: pokaż tylko ceny pobrane z API (wyklucz CACHE/MIXED)
+  const apiOnlyFlightsRaw = flights.filter(f => {
+    if (!f) return false;
+    if (isRoundTrip) {
+      // Round-trip combo `source` może być 'API' | 'CACHE' | 'MIXED' — wymagamy 'API'
+      return f.source === 'API';
+    }
+    // Single flight: require API source explicitly
+    return f.source === 'API';
+  });
+
+  // Sprawdź czy to round-trip combinations (mają outbound/inbound) - oceniaj po API-only set
+  const isRoundTrip = apiOnlyFlightsRaw.length > 0 && apiOnlyFlightsRaw[0]?.outbound && apiOnlyFlightsRaw[0]?.inbound;
+
+  // Reset paginacji gdy zmienia się lista widocznych lotów (API-only)
+  useEffect(() => {
+    setDisplayCount(20);
+  }, [apiOnlyFlightsRaw]);
 
   // Sortowanie lotów
   const sortedFlights = useMemo(() => {
-    if (flights.length === 0) return [];
+    if (apiOnlyFlightsRaw.length === 0) return [];
 
-    const flightsCopy = [...flights];
+    const flightsCopy = [...apiOnlyFlightsRaw];
 
     if (sortBy === 'price') {
-      // Sortuj po cenie (rosnąco)
+      // Sortuj po cenie (rosnąco) — używamy PLN do porównania (priceInPLN), jeśli dostępne
       return flightsCopy.sort((a, b) => {
-        const priceA = isRoundTrip ? a.totalPriceInPLN : a.price;
-        const priceB = isRoundTrip ? b.totalPriceInPLN : b.price;
+        const priceA = isRoundTrip ? (a.totalPriceInPLN ?? 0) : (a.priceInPLN ?? a.price ?? 0);
+        const priceB = isRoundTrip ? (b.totalPriceInPLN ?? 0) : (b.priceInPLN ?? b.price ?? 0);
         return priceA - priceB;
       });
     } else {
@@ -120,8 +134,8 @@ export default function FlightList() {
     if (sortedFlights.length === 0) return null;
 
     const prices = isRoundTrip
-      ? sortedFlights.filter(f => f.totalPriceInPLN).map(f => f.totalPriceInPLN)
-      : sortedFlights.filter(f => f.price).map(f => f.price);
+      ? sortedFlights.filter(f => f.totalPriceInPLN != null).map(f => f.totalPriceInPLN)
+      : sortedFlights.filter(f => (f.priceInPLN != null) || (f.price != null)).map(f => (f.priceInPLN != null ? f.priceInPLN : f.price));
 
     if (prices.length === 0) return null;
 
@@ -131,6 +145,26 @@ export default function FlightList() {
       avg: (prices.reduce((a, b) => a + b, 0) / prices.length).toFixed(2)
     };
   }, [sortedFlights, isRoundTrip]);
+
+  // Liczba wyników z API vs cache (dla panelu metryk i etykiet na kartach) - oblicz z Oryginalnych wyników `flights`
+  const sourceCounts = useMemo(() => {
+    const counts = { API: 0, CACHE: 0, MIXED: 0, UNKNOWN: 0 };
+    for (const f of flights) {
+      if (isRoundTrip) {
+        const s = f.source || (f.outbound?.source || f.inbound?.source) || 'UNKNOWN';
+        if (s === 'API') counts.API++;
+        else if (s === 'CACHE') counts.CACHE++;
+        else if (s === 'MIXED') counts.MIXED++;
+        else counts.UNKNOWN++;
+      } else {
+        const s = f.source || 'UNKNOWN';
+        if (s === 'API') counts.API++;
+        else if (s === 'CACHE') counts.CACHE++;
+        else counts.UNKNOWN++;
+      }
+    }
+    return counts;
+  }, [flights, isRoundTrip]);
 
   // Teraz możemy mieć warunki early return
   if (isLoading) {
@@ -180,9 +214,23 @@ export default function FlightList() {
               <span className="font-semibold">Dni z API:</span>{' '}
               <span>{metrics.daysFetched}/{metrics.totalDays}</span>
             </div>
+            <div>
+              <span className="font-semibold">Wyniki API:</span>{' '}
+              <span>{sourceCounts.API}</span> { /* percent */ }
+              <span className="text-gray-500"> ({(sourceCounts.API + sourceCounts.CACHE + sourceCounts.MIXED + sourceCounts.UNKNOWN) === 0 ? '0%' : `${Math.round((sourceCounts.API / (sourceCounts.API + sourceCounts.CACHE + sourceCounts.MIXED + sourceCounts.UNKNOWN)) * 100)}%`})</span>
+            </div>
+            <div>
+              <span className="font-semibold">Wyniki Cache:</span>{' '}
+              <span>{sourceCounts.CACHE}</span>
+              <span className="text-gray-500"> ({(sourceCounts.API + sourceCounts.CACHE + sourceCounts.MIXED + sourceCounts.UNKNOWN) === 0 ? '0%' : `${Math.round((sourceCounts.CACHE / (sourceCounts.API + sourceCounts.CACHE + sourceCounts.MIXED + sourceCounts.UNKNOWN)) * 100)}%`})</span>
+            </div>
             <div className="ml-auto">
               <span className="font-semibold">Cache vs API:</span>{' '}
               <span>{metrics.percentFromCache}% cache / {metrics.percentFromApi}% API</span>
+            </div>
+            <div className="ml-6 text-sm text-gray-500">
+              <span className="font-semibold">Wyniki (cache/API):</span>{' '}
+              <span>{sourceCounts.CACHE}/{sourceCounts.API} ({(sourceCounts.CACHE + sourceCounts.API) === 0 ? '0%' : `${Math.round((sourceCounts.API / (sourceCounts.CACHE + sourceCounts.API)) * 100)}% API`})</span>
             </div>
           </div>
         </div>
@@ -212,8 +260,11 @@ export default function FlightList() {
       <div className="bg-white rounded-lg shadow-lg overflow-hidden">
         <div className="p-4 bg-gray-50 border-b flex items-center justify-between">
           <h3 className="text-lg font-semibold">
-            ✈️ Znaleziono {flights.length} {isRoundTrip ? 'kombinacji' : 'lotów'}
+            ✈️ Znaleziono {apiOnlyFlightsRaw.length} {isRoundTrip ? 'kombinacji' : 'lotów'}
           </h3>
+          {flights.length !== apiOnlyFlightsRaw.length && (
+            <div className="text-xs text-gray-500">⚠️ Pokazywane są tylko ceny pobrane z API — ukryto {flights.length - apiOnlyFlightsRaw.length} wyniki (cache/mixed).</div>
+          )}
 
           {/* Przyciski sortowania */}
           <div className="flex gap-2">
@@ -331,6 +382,7 @@ function SingleFlightCard({ flight, onAddFavorite, onCreateAlert, isAuthenticate
               ⚠️ Tylko {flight.faresLeft} miejsc!
             </div>
           )}
+          {/* FareFinder monthly estimates are shown as standard API results */}
         </div>
 
         {/* Prawa strona - cena i akcje */}
@@ -349,6 +401,16 @@ function SingleFlightCard({ flight, onAddFavorite, onCreateAlert, isAuthenticate
                     ≈ {flight.priceInPLN.toFixed(2)} PLN
                   </div>
                 )}
+                {/* Etykieta źródła ceny */}
+                <div className="text-xs mt-1">
+                  {flight.source === 'API' ? (
+                    <span className="inline-block px-2 py-1 rounded bg-green-100 text-green-800">Cena pobrana z API</span>
+                  ) : (flight.source === 'CACHE' ? (
+                    <span className="inline-block px-2 py-1 rounded bg-gray-100 text-gray-800">Cena z cache</span>
+                  ) : (
+                    <span className="inline-block px-2 py-1 rounded bg-yellow-100 text-yellow-800">Źródło nieznane</span>
+                  ))}
+                </div>
               </div>
 
               {isAuthenticated && (
@@ -398,15 +460,38 @@ function RoundTripCard({ combo, onAddFavorite, onCreateAlert, isAuthenticated, s
     return null; // Nie wyświetlaj kombinacji bez ceny
   }
 
-  // Oblicz różnicę dat (0 = ten sam dzień, 1 = następny dzień, itd.)
+  // Oblicz różnicę czasową na podstawie rzeczywistych czasów przylotu/odlotu
+  const outArrivalTime = new Date(`${outbound.date}T${outbound.arrival}:00`);
+  const inDepartureTime = new Date(`${inbound.date}T${inbound.departure}:00`);
+  const timeDiffMs = inDepartureTime - outArrivalTime;
+  const timeDiffHoursRaw = timeDiffMs / (1000 * 60 * 60);
+  const hours = Math.floor(Math.abs(timeDiffHoursRaw));
+  const minutes = Math.round(Math.abs((timeDiffHoursRaw - hours) * 60));
+  // Adjust minute overflow
+  let displayHours = hours;
+  let displayMinutes = minutes;
+  if (displayMinutes === 60) { displayHours += 1; displayMinutes = 0; }
+
+  // Oblicz liczbę nocy jako różnicę dat (ile nocy spędzono między datami)
   const outDate = new Date(outbound.date);
   const inDate = new Date(inbound.date);
-  const dateDiff = Math.round((inDate - outDate) / (1000 * 60 * 60 * 24));
+  const nights = Math.max(0, Math.round((inDate - outDate) / (1000 * 60 * 60 * 24)));
 
-  // Jeśli ten sam dzień lub następny - pokaż godziny, w innym przypadku noce
-  const stayLabel = dateDiff === 0
-    ? `${stayDays} ${stayDays === 1 ? 'godzina' : stayDays <= 4 ? 'godziny' : 'godzin'}`
-    : `${dateDiff} ${dateDiff === 1 ? 'noc' : dateDiff <= 4 ? 'noce' : 'nocy'}`;
+  // Jeśli czas pobytu < 24h, pokaż ilość godzin (np. 10h). W przeciwnym razie pokaż liczbę nocy (np. 1 noc, 2 noce)
+  let stayLabel;
+  if (timeDiffMs < 24 * 60 * 60 * 1000) {
+    // Poniżej 24h - pokaż godziny i minuty
+    if (displayMinutes > 0) {
+      stayLabel = `${displayHours}h ${displayMinutes}m`;
+    } else {
+      stayLabel = `${displayHours}h`;
+    }
+  } else {
+    // Powyżej 24h - pokaż liczby nocy z poprawnym odmienianiem
+    const count = nights;
+    const suffix = count === 1 ? 'noc' : (count >= 2 && count <= 4 ? 'noce' : 'nocy');
+    stayLabel = `${count} ${suffix}`;
+  }
 
 
   // Lotnisko powrotu (destination z lotu POWRÓT)
@@ -429,10 +514,8 @@ function RoundTripCard({ combo, onAddFavorite, onCreateAlert, isAuthenticated, s
           <span className="text-gray-300">→</span>
           <span>{returnName}</span>
         </div>
-        {/* DEBUG: pokaż pełny obiekt combo */}
-        <pre style={{fontSize: '10px', color: '#888', background: '#f8f8ff', padding: '4px', borderRadius: '4px', marginTop: '4px', maxWidth: '100%', overflowX: 'auto'}}>
-          {JSON.stringify(combo, null, 2)}
-        </pre>
+        {/* Removed: Liczba nocy label as requested by user */}
+        {/* Kombinacja zwrócona przez backend (brak syntetycznych kombinacji) */}
       </div>
 
       {/* Nagłówek z długością pobytu i ceną */}
@@ -448,6 +531,16 @@ function RoundTripCard({ combo, onAddFavorite, onCreateAlert, isAuthenticated, s
           {/* Pokaż składowe ceny w oryginalnych walutach */}
           <div className="text-sm text-gray-500 mt-1">
             ({(outbound.price || 0).toFixed(2)} {outbound.currency || '?'} + {(inbound.price || 0).toFixed(2)} {inbound.currency || '?'})
+          </div>
+          <div className="text-xs mt-1">
+            {combo.source === 'API' ? (
+              <span className="inline-block px-2 py-1 rounded bg-green-100 text-green-800">Cena pobrana z API</span>
+            ) : (combo.source === 'CACHE' ? (
+              <span className="inline-block px-2 py-1 rounded bg-gray-100 text-gray-800">Cena z cache</span>
+            ) : (
+              <span className="inline-block px-2 py-1 rounded bg-yellow-100 text-yellow-800">Mieszane (API + Cache)</span>
+            ))}
+            { /* Removed 'Zweryfikowano przez Ryanair' label per request */ }
           </div>
         </div>
       </div>
@@ -477,6 +570,22 @@ function RoundTripCard({ combo, onAddFavorite, onCreateAlert, isAuthenticated, s
               <Clock className="w-3 h-3" />
               {outbound.duration}
             </div>
+            {/* Leg-level price and source badge for outbound leg */}
+            <div className="mt-2">
+              <div className="text-sm text-gray-900 font-semibold">{(outbound.price || 0).toFixed(2)} {outbound.currency || '?'}</div>
+              {outbound.currency !== 'PLN' && outbound.priceInPLN && (
+                <div className="text-xs text-gray-500">≈ {outbound.priceInPLN.toFixed(2)} PLN</div>
+              )}
+              <div className="text-xs mt-1">
+                {outbound.source === 'API' ? (
+                  <span className="inline-block px-2 py-1 rounded bg-green-100 text-green-800">Cena pobrana z API</span>
+                ) : outbound.source === 'CACHE' ? (
+                  <span className="inline-block px-2 py-1 rounded bg-gray-100 text-gray-800">Cena z cache</span>
+                ) : (
+                  <span className="inline-block px-2 py-1 rounded bg-yellow-100 text-yellow-800">Źródło nieznane</span>
+                )}
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -505,6 +614,22 @@ function RoundTripCard({ combo, onAddFavorite, onCreateAlert, isAuthenticated, s
             <div className="text-xs flex items-center gap-1">
               <Clock className="w-3 h-3" />
               {inbound.duration}
+            </div>
+            {/* Leg-level price and source badge for inbound leg */}
+            <div className="mt-2">
+              <div className="text-sm text-gray-900 font-semibold">{(inbound.price || 0).toFixed(2)} {inbound.currency || '?'}</div>
+              {inbound.currency !== 'PLN' && inbound.priceInPLN && (
+                <div className="text-xs text-gray-500">≈ {inbound.priceInPLN.toFixed(2)} PLN</div>
+              )}
+              <div className="text-xs mt-1">
+                {inbound.source === 'API' ? (
+                  <span className="inline-block px-2 py-1 rounded bg-green-100 text-green-800">Cena pobrana z API</span>
+                ) : inbound.source === 'CACHE' ? (
+                  <span className="inline-block px-2 py-1 rounded bg-gray-100 text-gray-800">Cena z cache</span>
+                ) : (
+                  <span className="inline-block px-2 py-1 rounded bg-yellow-100 text-yellow-800">Źródło nieznane</span>
+                )}
+              </div>
             </div>
           </div>
         </div>

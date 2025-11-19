@@ -50,18 +50,36 @@ function _isRyanairUrl(url) {
   }
 }
 
-// Globalne szeregowanie – każde żądanie /ryanair/* wykona się po poprzednim,
-// z miękkim opóźnieniem 600±200ms między wywołaniami (smartDelay).
+// Globalne szeregowanie – sterowane semaphorem, ze wsparciem dla maxParallelRequests
+// To pozwala wykonywać wiele requestów równolegle, ale nadal kontrolujemy opóźnienia
+let _activeRequests = 0;
+const _waitingResolvers = [];
 async function _enqueue(fn) {
-  const run = async () => {
-    if (_ryanairState.blocked) {
-      return _markRyanairBlocked('Stan blokady aktywny');
-    }
+  if (_ryanairState.blocked) {
+    return _markRyanairBlocked('Stan blokady aktywny');
+  }
+
+  await new Promise(resolve => {
+    const tryTake = () => {
+      if (_ryanairState.blocked) return resolve(_markRyanairBlocked('Stan blokady aktywny'));
+      const max = RATE_LIMIT_CONFIG.maxParallelRequests || 1;
+      if (_activeRequests < max) {
+        _activeRequests++;
+        return resolve();
+      }
+      _waitingResolvers.push(tryTake);
+    };
+    tryTake();
+  });
+
+  try {
     await smartDelay();
-    return fn();
-  };
-  _ryanairState.chain = _ryanairState.chain.then(run, run);
-  return _ryanairState.chain;
+    return await fn();
+  } finally {
+    _activeRequests = Math.max(0, _activeRequests - 1);
+    const next = _waitingResolvers.shift();
+    if (next) next();
+  }
 }
 
 export function isRyanairBlocked() {
@@ -145,6 +163,65 @@ async function ensureBackendUp() {
 }
 
 /**
+ * Debug helper: sprawdź jedną, konkretną parę dat (outDate + inDate dla returnAirport)
+ * Zwraca szczegóły o lotach TAM/POWRÓT, przyczynach odrzucenia i akceptowanych kombinacjach
+ * Do użycia w devtools: window.debugCheckPair({ origin, destination, outDate, inDate, returnAirport, adults, maxPrice })
+ */
+export async function debugCheckPair({ origin, destination, outDate, inDate, returnAirport, adults = 1, maxPrice = 9999 }) {
+  const MET = { apiCalls: 0, fareFinderCalls: 0 };
+
+  // Pobierz TAM (cache lub api)
+  const cachedOut = await getFlightsFromCache(origin, destination, outDate, adults);
+  let outFlights = cachedOut !== null ? cachedOut.map(f => ({ ...f, source: 'CACHE' })) : null;
+  if (!outFlights) {
+    MET.apiCalls += 1; // We'll mark an API call here
+    outFlights = (await searchFlights({ origin, destination, dateOut: outDate, adults }, MET)).map(f => ({ ...f, source: 'API' }));
+  }
+
+  // Pobierz POWRÓT (cache lub api)
+  const cachedIn = await getFlightsFromCache(destination, returnAirport, inDate, adults);
+  let inFlights = cachedIn !== null ? cachedIn.map(f => ({ ...f, source: 'CACHE' })) : null;
+  if (!inFlights) {
+    MET.apiCalls += 1;
+    inFlights = (await searchFlights({ origin: destination, destination: returnAirport, dateOut: inDate, adults }, MET)).map(f => ({ ...f, source: 'API' }));
+  }
+
+  const debugOut = outFlights.filter(f => f.priceInPLN != null && f.departure && f.arrival);
+  const debugIn = inFlights.filter(f => f.priceInPLN != null && f.departure && f.arrival);
+
+  const results = [];
+  for (const out of debugOut) {
+    for (const inbound of debugIn) {
+      const outArrival = new Date(`${out.date}T${out.arrival}:00`);
+      const inDeparture = new Date(`${inbound.date}T${inbound.departure}:00`);
+      const diffH = (inDeparture - outArrival) / (1000 * 60 * 60);
+      const total = (out.priceInPLN || 0) + (inbound.priceInPLN || 0);
+      const reasons = [];
+      if (diffH < 7) reasons.push('czas<7h');
+      if (total > maxPrice) reasons.push('cena>max');
+      const stayDays = Math.round((new Date(inbound.date) - new Date(out.date)) / (1000 * 60 * 60 * 24)) + 1;
+      if (stayDays < 1) reasons.push('pobyt<1');
+      results.push({ outbound: out, inbound, totalPriceInPLN: total, timeDiffHours: diffH, stayDays, accepted: reasons.length === 0, reasons });
+    }
+  }
+
+  const accepted = results.filter(r => r.accepted);
+  const rejected = results.filter(r => !r.accepted);
+
+  console.log(`🔍 debugCheckPair: ${origin}->${destination} ${outDate} + ${destination}->${returnAirport} ${inDate}`);
+  console.log(`   Out flights: ${debugOut.length}, In flights: ${debugIn.length}, Total pairs: ${results.length}`);
+  console.log(`   Accepted: ${accepted.length}, Rejected: ${rejected.length}`);
+  rejected.slice(0, 20).forEach(r => console.log(`   ❌ Rejected: ${r.outbound.date} ${r.outbound.arrival} + ${r.inbound.date} ${r.inbound.departure} -> ${r.totalPriceInPLN} PLN; outPrice=${r.outbound.priceInPLN} (${r.outbound.price} ${r.outbound.currency}), inPrice=${r.inbound.priceInPLN} (${r.inbound.price} ${r.inbound.currency}); reasons: ${r.reasons.join(', ')}`));
+  accepted.slice(0, 20).forEach(r => console.log(`   ✅ Accepted: ${r.outbound.date} ${r.outbound.arrival} + ${r.inbound.date} ${r.inbound.departure} -> ${r.totalPriceInPLN} PLN; outPrice=${r.outbound.priceInPLN} (${r.outbound.price} ${r.outbound.currency}), inPrice=${r.inbound.priceInPLN} (${r.inbound.price} ${r.inbound.currency}); legSources: ${r.outbound.source}/${r.inbound.source}`));
+
+  return { MET, accepted, rejected, results };
+}
+
+// Przydatne dla deva — expose do okna (devtools)
+if (typeof window !== 'undefined') {
+  window.debugCheckPair = debugCheckPair;
+}
+/**
  * Cache dla cen miesięcznych z FareFinder - używa localStorage aby przetrwać odświeżenie
  * Struktura: { "WAW-AGP-2024-12-01-2024-12-31-round-2": { prices: [[date, price], ...], timestamp: 1234567890 } }
  */
@@ -160,10 +237,11 @@ export function getLastMetrics() {
 
 // Konfiguracja opóźnień między requestami (anty-rate-limit)
 const RATE_LIMIT_CONFIG = {
-  baseDelay: 600,        // Podstawowe opóźnienie 600ms między requestami
-  jitterRange: 200,      // Losowy jitter ±200ms (400-800ms total)
+  baseDelay: 300,        // Podstawowe opóźnienie 300ms między requestami (szybsze domyślnie)
+  jitterRange: 200,      // Losowy jitter ±200ms (200-600ms total)
   retryDelay: 2000,      // Opóźnienie po błędzie 409/429
-  maxRetries: 2          // Maksymalna liczba prób przy błędzie
+  maxRetries: 2,         // Maksymalna liczba prób przy błędzie
+  maxParallelRequests: 6 // Maksymalna liczba równoległych requestów do Ryanair (sterowana przez semaphore)
 };
 
 /**
@@ -175,6 +253,8 @@ export function configureRateLimit(config) {
   if (config.jitterRange !== undefined) RATE_LIMIT_CONFIG.jitterRange = config.jitterRange;
   if (config.retryDelay !== undefined) RATE_LIMIT_CONFIG.retryDelay = config.retryDelay;
   if (config.maxRetries !== undefined) RATE_LIMIT_CONFIG.maxRetries = config.maxRetries;
+  if (config.maxParallelRequests !== undefined) RATE_LIMIT_CONFIG.maxParallelRequests = config.maxParallelRequests;
+  if (config.maxParallelRequests !== undefined) console.log('⚙️ Rate limit parallelism updated:', RATE_LIMIT_CONFIG.maxParallelRequests);
   console.log('⚙️ Rate limit config updated:', RATE_LIMIT_CONFIG);
 }
 
@@ -198,6 +278,82 @@ function createMetrics() {
     daysFromCache: 0,        // ile dni poszło z cache (bez HTTP)
     daysFetched: 0,          // ile dni pobrano z API
   };
+}
+
+// Convert 'HH:MM' -> minutes from midnight
+function timeStrToMinutes(t) {
+  if (!t || typeof t !== 'string') return null;
+  const parts = t.split(':');
+  if (parts.length !== 2) return null;
+  const hh = parseInt(parts[0], 10);
+  const mm = parseInt(parts[1], 10);
+  if (Number.isNaN(hh) || Number.isNaN(mm)) return null;
+  return hh * 60 + mm;
+}
+
+// Check whether a 'HH:MM' string is within inclusive time range from->to
+function isTimeBetween(timeStr, fromStr, toStr) {
+  if (!timeStr) return false;
+  const t = timeStrToMinutes(timeStr);
+  if (t === null) return false;
+  const from = timeStrToMinutes(fromStr || '00:00');
+  const to = timeStrToMinutes(toStr || '23:59');
+  if (from === null || to === null) return false;
+  if (from <= to) {
+    return t >= from && t <= to;
+  } else {
+    // wrap-around (e.g., from 22:00 to 03:00)
+    return t >= from || t <= to;
+  }
+}
+
+// Apply time filters to a list of flights: filters = { departureFrom, departureTo, arrivalFrom, arrivalTo }
+function applyTimeFiltersToFlights(flights, filters = {}) {
+  if (!filters) return flights;
+  const { departureFrom, departureTo, arrivalFrom, arrivalTo } = filters;
+  if (!departureFrom && !departureTo && !arrivalFrom && !arrivalTo) return flights;
+  return flights.filter(f => {
+    const depOk = departureFrom || departureTo ? isTimeBetween(f.departure, departureFrom, departureTo) : true;
+    const arrOk = arrivalFrom || arrivalTo ? isTimeBetween(f.arrival, arrivalFrom, arrivalTo) : true;
+    return depOk && arrOk;
+  });
+}
+
+// Apply day-of-week filter to flights based on `filters.departureDays` (array of booleans Mon->Sun)
+function isDateMatchingDays(dateStr, daysArray) {
+  if (!daysArray || daysArray.length !== 7) return true; // default all
+  const d = new Date(dateStr);
+  if (!d || Number.isNaN(d.getTime())) return true;
+  const dow = d.getDay(); // 0 = Sunday
+  // Convert to Mon index 0..6 where 0 = Monday, but our daysArray uses Mon first index 0
+  const idx = (dow === 0) ? 6 : (dow - 1);
+  return !!daysArray[idx];
+}
+
+function applyDayFiltersToFlights(flights, filters = {}) {
+  const { departureDays, returnDays } = filters;
+  if (!departureDays && !returnDays) return flights;
+  return flights.filter(f => {
+    const dateStr = f.searched_date || f.date;
+    if (!dateStr) return true;
+    // For single flights use departureDays; for round trip legs we may pass both
+    if (departureDays && !returnDays) {
+      return isDateMatchingDays(dateStr, departureDays);
+    }
+    if (returnDays && !departureDays) {
+      return isDateMatchingDays(dateStr, returnDays);
+    }
+    return true;
+  });
+}
+
+// Convert boolean days array (Mon..Sun) to Ryanair weekday list string 'MONDAY,TUESDAY'
+function daysArrayToWeekdayList(daysArray) {
+  if (!Array.isArray(daysArray) || daysArray.length !== 7) return null;
+  const names = ['MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY','SUNDAY'];
+  const sel = [];
+  for (let i=0;i<7;i++) if (daysArray[i]) sel.push(names[i]);
+  return sel.length > 0 ? sel.join(',') : null;
 }
 
 /**
@@ -228,7 +384,19 @@ async function getFlightsFromCache(origin, destination, date, adults = 1) {
       return null;
     }
 
-    return result.data.flights || result.data;
+    const flights = result.data.flights || result.data;
+    // Oznacz wszystkie loty zwrócone z cache jako CACHE
+    if (Array.isArray(flights)) {
+      return flights.map(f => ({
+        ...f,
+        source: f.source || 'CACHE',
+        origin: f.origin || origin,
+        destination: f.destination || destination,
+        originName: f.originName || null,
+        destinationName: f.destinationName || null
+      }));
+    }
+    return flights;
   } catch (e) {
     console.warn('Błąd odczytu cache lotów:', e);
     return null;
@@ -245,9 +413,9 @@ async function saveFlightsToCache(origin, destination, date, flights, adults = 1
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        cache_key: cacheKey,
-        data: { flights },
-        ttl: 3600  // 1 godzina
+          cache_key: cacheKey,
+          data: { flights },
+          ttl: 86400  // 24 godziny
       })
     });
     if (!res.ok) {
@@ -451,7 +619,16 @@ export async function searchFlights(params, metrics) {
     }
 
     const data = await response.json();
-    return parseFlights(data);
+    // Parse and annotate with origin/destination so callers can rely on these fields
+    const parsed = parseFlights(data);
+    const annotated = parsed.map(f => ({
+      ...f,
+      origin: origin,
+      destination: destination,
+      originName: null,
+      destinationName: null
+    }));
+    return annotated;
   } catch (error) {
     console.error('Błąd wyszukiwania:', error);
     if (error?.hardBlocked) throw error; // propaguj blokadę
@@ -485,7 +662,7 @@ function generateDateRange(dateFrom, dateTo) {
  */
 export async function searchFlightsRange(params, externalMetrics = null) {
   const METRICS = externalMetrics || createMetrics();
-  const { origin, destination, dateFrom, dateTo, maxPrice, adults = 1 } = params;
+  const { origin, destination, dateFrom, dateTo, maxPrice, adults = 1, departureFrom, departureTo, arrivalFrom, arrivalTo, departureDays } = params;
 
   console.log(`Szukam lotów jednokierunkowych: ${dateFrom} - ${dateTo}, max cena: ${maxPrice || 'brak'}`);
 
@@ -508,7 +685,14 @@ export async function searchFlightsRange(params, externalMetrics = null) {
 
     allPossibleDates = availableDates.filter(dateStr => {
       const d = new Date(dateStr);
-      return d >= userDateFrom && d <= userDateTo;
+      if (!d || d < userDateFrom || d > userDateTo) return false;
+      if (departureDays && Array.isArray(departureDays) && departureDays.length === 7) {
+        // convert date to day-of-week and check
+        const dow = d.getDay(); // 0=Sunday
+        const idx = (dow === 0) ? 6 : (dow - 1); // 0=Mon
+        return !!departureDays[idx];
+      }
+      return true;
     });
 
     console.log(`⚡ OPTYMALIZACJA: Sprawdzam tylko ${allPossibleDates.length} dni z lotami (zamiast wszystkich dni w zakresie)`);
@@ -516,6 +700,14 @@ export async function searchFlightsRange(params, externalMetrics = null) {
     // ⚠️ Brak danych o dostępności (błąd API lub nowa trasa) - generuj wszystkie daty
     console.log(`⚠️ Brak danych o dostępności - sprawdzam wszystkie dni w zakresie`);
     allPossibleDates = generateDateRange(dateFrom, dateTo);
+      if (departureDays && Array.isArray(departureDays) && departureDays.length === 7) {
+        allPossibleDates = allPossibleDates.filter(dt => {
+          const d = new Date(dt);
+          const dow = d.getDay();
+          const idx = (dow === 0) ? 6 : (dow - 1);
+          return !!departureDays[idx];
+        });
+      }
   }
 
   // Sprawdź najpierw ile dni mamy już w cache
@@ -557,6 +749,7 @@ export async function searchFlightsRange(params, externalMetrics = null) {
       dateFrom,
       dateTo,
       adults
+      , outboundDays: departureDays
     }, METRICS);
 
     usedFareFinder = true;
@@ -628,7 +821,8 @@ export async function searchFlightsRange(params, externalMetrics = null) {
     const cachedFlights = await getFlightsFromCache(origin, destination, date, adults);
     if (cachedFlights !== null) {
       // Filtruj po cenie jeśli trzeba
-      let flightsToAdd = cachedFlights;
+      // Oznacz jako CACHE
+      let flightsToAdd = cachedFlights.map(f => ({ ...f, source: 'CACHE' }));
       if (maxPrice) {
         flightsToAdd = cachedFlights.filter(f => {
           const price = f.priceInPLN || convertToPLN(f.price, f.currency);
@@ -640,7 +834,12 @@ export async function searchFlightsRange(params, externalMetrics = null) {
       }
 
       const withDates = flightsToAdd.map(f => ({ ...f, searched_date: date }));
-      results.push(...withDates);
+      // Zastosuj filtr czasowy jeśli podano
+      const filteredWithDates = applyTimeFiltersToFlights(withDates, { departureFrom, departureTo, arrivalFrom, arrivalTo });
+      results.push(...filteredWithDates);
+      if (filteredWithDates.length !== withDates.length) {
+        console.log(`⏱️ Filtr godzinowy zastosowany (${withDates.length} -> ${filteredWithDates.length}) dla ${date}`);
+      }
       cachedCount++;
     } else {
       // Brak w cache - trzeba pobrać
@@ -673,11 +872,12 @@ export async function searchFlightsRange(params, externalMetrics = null) {
       try {
         const res = await searchFlights({ origin, destination, dateOut: d, adults }, METRICS);
 
-        // Zapisz WSZYSTKIE loty do cache (bez filtrowania)
-        await saveFlightsToCache(origin, destination, d, res, adults);
+        // Oznacz jako API i zapisz WSZYSTKIE loty do cache (bez filtrowania)
+        const resWithSource = res.map(f => ({ ...f, source: 'API' }));
+        await saveFlightsToCache(origin, destination, d, resWithSource, adults);
 
         // Ale do wyników dodaj TYLKO te które spełniają warunek ceny
-        let flightsToAdd = res;
+        let flightsToAdd = resWithSource;
         if (maxPrice) {
           flightsToAdd = res.filter(f => {
             const price = f.priceInPLN || convertToPLN(f.price, f.currency);
@@ -689,7 +889,11 @@ export async function searchFlightsRange(params, externalMetrics = null) {
         }
 
         const withDates = flightsToAdd.map(f => ({ ...f, searched_date: d }));
-        results.push(...withDates);
+        const filteredWithDates = applyTimeFiltersToFlights(withDates, { departureFrom, departureTo, arrivalFrom, arrivalTo });
+        results.push(...filteredWithDates);
+        if (filteredWithDates.length !== withDates.length) {
+          console.log(`⏱️ Filtr godzinowy zastosowany (${withDates.length} -> ${filteredWithDates.length}) dla ${d}`);
+        }
         success = true;
       } catch (error) {
         if (error?.hardBlocked) { throw error; }
@@ -732,7 +936,7 @@ export async function searchFlightsRange(params, externalMetrics = null) {
  * Z CACHE: jeśli już pobieraliśmy te dane w ciągu ostatniej godziny, zwróć z cache (localStorage)
  */
 async function getMonthlyFares(params, metrics) {
-  const { origin, destination, outFrom, outTo, stayDaysMin, stayDaysMax, adults = 1 } = params;
+  const { origin, destination, outFrom, outTo, stayDaysMin, stayDaysMax, adults = 1, departureFrom = '00:00', departureTo = '23:59', returnArrivalFrom = '00:00', returnArrivalTo = '23:59', outboundDays = null, inboundDays = null } = params;
 
   // Sprawdź cache
   const cacheKey = getCacheKey({
@@ -768,11 +972,20 @@ async function getMonthlyFares(params, metrics) {
       market: 'pl-pl',
       searchMode: 'ALL'
     });
+    if (departureFrom) queryParams.set('outboundDepartureTimeFrom', departureFrom);
+    if (departureTo) queryParams.set('outboundDepartureTimeTo', departureTo);
+    if (returnArrivalFrom) queryParams.set('inboundDepartureTimeFrom', returnArrivalFrom);
+    if (returnArrivalTo) queryParams.set('inboundDepartureTimeTo', returnArrivalTo);
+    const outboundList = daysArrayToWeekdayList(outboundDays);
+    const inboundList = daysArrayToWeekdayList(inboundDays);
+    if (outboundList) queryParams.set('outboundDepartureDaysOfWeek', outboundList);
+    if (inboundList) queryParams.set('inboundDepartureDaysOfWeek', inboundList);
 
     console.log(`📊 Pobieram ceny miesięczne: ${origin}→${destination}`);
 
     // Miękki limiter (600±200ms)
     await smartDelay();
+  // Do not force confirm=true here — keep confirm optional (default backend=false)
   const response = await safeRyanairFetch(`${url}?${queryParams}`);
   if (metrics) { metrics.apiCalls += 1; metrics.fareFinderCalls += 1; }
 
@@ -801,17 +1014,16 @@ async function getMonthlyFares(params, metrics) {
                     || fare.inbound?.date?.split('T')[0]
                     || fare.arrivalDate?.split('T')[0];
 
-        const outPrice = fare.outbound?.price?.value
-                      || fare.outbound?.price
-                      || fare.price?.outbound
-                      || 0;
+        // Extract raw numeric values and currencies, then convert to PLN
+        const rawOutPrice = fare.outbound?.price?.value ?? fare.outbound?.price ?? fare.price?.outbound ?? 0;
+        const outCurrency = fare.outbound?.price?.currencyCode ?? fare.outbound?.price?.currency ?? fare.price?.currency ?? 'PLN';
+        const outPricePLN = convertToPLN(Number(rawOutPrice) || 0, outCurrency) || Number(rawOutPrice) || 0;
 
-        const inPrice = fare.inbound?.price?.value
-                     || fare.inbound?.price
-                     || fare.price?.inbound
-                     || 0;
+        const rawInPrice = fare.inbound?.price?.value ?? fare.inbound?.price ?? fare.price?.inbound ?? 0;
+        const inCurrency = fare.inbound?.price?.currencyCode ?? fare.inbound?.price?.currency ?? fare.price?.currency ?? 'PLN';
+        const inPricePLN = convertToPLN(Number(rawInPrice) || 0, inCurrency) || Number(rawInPrice) || 0;
 
-        const totalPrice = outPrice + inPrice;
+        const totalPrice = outPricePLN + inPricePLN;
 
         if (outDate && inDate) {
           const key = `${outDate}|${inDate}`;
@@ -847,7 +1059,7 @@ async function getMonthlyFares(params, metrics) {
  * Z CACHE: jeśli już pobieraliśmy te dane w ciągu ostatniej godziny, zwróć z cache
  */
 async function getMonthlyFaresOneWay(params, metrics) {
-  const { origin, destination, dateFrom, dateTo, adults = 1 } = params;
+  const { origin, destination, dateFrom, dateTo, adults = 1, departureFrom = '00:00', departureTo = '23:59', outboundDays = null } = params;
 
   // Sprawdź cache
   const cacheKey = getCacheKey({
@@ -875,18 +1087,20 @@ async function getMonthlyFaresOneWay(params, metrics) {
       arrivalAirportIataCode: destination,
       outboundDepartureDateFrom: dateFrom,
       outboundDepartureDateTo: dateTo,
-      outboundDepartureDaysOfWeek: 'MONDAY,TUESDAY,WEDNESDAY,THURSDAY,FRIDAY,SATURDAY,SUNDAY',
-      outboundDepartureTimeFrom: '00:00',
-      outboundDepartureTimeTo: '23:59',
+      outboundDepartureTimeFrom: departureFrom,
+      outboundDepartureTimeTo: departureTo,
       adultPaxCount: adults,
       market: 'pl-pl',
       searchMode: 'ALL'
     });
+    const outboundList = daysArrayToWeekdayList(outboundDays);
+    if (outboundList) queryParams.set('outboundDepartureDaysOfWeek', outboundList);
 
     console.log(`📊 Pobieram ceny miesięczne (jednokierunkowe): ${origin}→${destination}`);
 
     // Miękki limiter (600±200ms)
     await smartDelay();
+    // Do not force confirm=true here — keep confirm optional (default backend=false)
   const response = await safeRyanairFetch(`${url}?${queryParams}`);
   if (metrics) { metrics.apiCalls += 1; metrics.fareFinderCalls += 1; }
 
@@ -902,7 +1116,9 @@ async function getMonthlyFaresOneWay(params, metrics) {
     if (data.fares && Array.isArray(data.fares)) {
       data.fares.forEach((fare) => {
         const outDate = fare.outbound?.departureDate?.split('T')[0];
-        const outPrice = fare.outbound?.price?.value || 0;
+        const rawOutPrice = fare.outbound?.price?.value ?? fare.outbound?.price ?? 0;
+        const outCurrency = fare.outbound?.price?.currencyCode ?? fare.outbound?.price?.currency ?? 'PLN';
+        const outPrice = convertToPLN(Number(rawOutPrice) || 0, outCurrency) || Number(rawOutPrice) || 0;
 
         if (outDate && outPrice > 0) {
           // Zachowaj najtańszą cenę dla tej daty
@@ -928,6 +1144,11 @@ async function getMonthlyFaresOneWay(params, metrics) {
   }
 }
 
+// Wrapper exported for other modules
+export async function getMonthlyFaresForRoute(params) {
+  return await getMonthlyFaresOneWay(params);
+}
+
 /**
  * Wyszukaj loty w dwie strony dla zakresów z długością pobytu
  */
@@ -942,7 +1163,17 @@ export async function searchRoundTripRange(params) {
     maxPrice,
     adults = 1,
     allowDifferentReturnAirport = false,
-    availableReturnAirports = null
+    availableReturnAirports = null,
+    departureFrom, // outbound departure HH:MM
+    departureTo,
+    arrivalFrom, // outbound arrival HH:MM
+    arrivalTo,
+    returnDepartureFrom, // inbound departure HH:MM (departure from dest)
+    returnDepartureTo,
+    returnArrivalFrom, // inbound arrival HH:MM (arrival at origin)
+    returnArrivalTo,
+    departureDays, // array of booleans for Mon..Sun
+    returnDays
   } = params;
 
   console.log(`Szukam round-trip: ${outFrom} - ${outTo}, pobyt ${stayDaysMin}-${stayDaysMax} dni, max cena: ${maxPrice || 'brak'}`);
@@ -983,7 +1214,7 @@ export async function searchRoundTripRange(params) {
 
   // OPTYMALIZACJA: Jeśli podano maxPrice i zakres jest DUŻY, najpierw pobierz ceny dla całego miesiąca
   let monthlyPrices = new Map();
-  let monthlyRawData = null; // surowe dane z FareFinder (do fallbacku syntetycznego)
+  let monthlyRawData = null; // surowe dane z FareFinder (zachowuję dla debugowania; NIE wykorzystuję ich do tworzenia syntetycznych kombinacji)
   let cheapCombinations = new Set(); // Zbiór tanich PAR dat: "2025-12-02|2025-12-10"
 
   if (useFareFinderOptimization) {
@@ -996,7 +1227,9 @@ export async function searchRoundTripRange(params) {
         destination,
         dateFrom: outFrom,
         dateTo: outTo,
-        adults
+        adults,
+        departureFrom, departureTo,
+        outboundDays: departureDays
       }, METRICS);
 
       // Pobierz miesięczne ceny dla POWRÓT - dla KAŻDEGO lotniska powrotu
@@ -1008,6 +1241,9 @@ export async function searchRoundTripRange(params) {
           dateFrom: outFrom,
           dateTo: outTo,
           adults
+        ,departureFrom: returnDepartureFrom, departureTo: returnDepartureTo
+        ,arrivalFrom: returnArrivalFrom, arrivalTo: returnArrivalTo
+        ,outboundDays: returnDays
         }, METRICS);
         if (inMap.size > 0) {
           inMapByAirport.set(returnAirport, inMap);
@@ -1049,6 +1285,8 @@ export async function searchRoundTripRange(params) {
         stayDaysMin,
         stayDaysMax,
         adults
+        ,departureFrom, departureTo
+        ,returnArrivalFrom, returnArrivalTo
       }, METRICS);
 
       monthlyPrices = result.prices;
@@ -1072,23 +1310,28 @@ export async function searchRoundTripRange(params) {
   if (useFareFinderOptimization && cheapCombinations.size === 0) {
     console.log('⚠️ Brak tanich par z roundTripFares – próbuję kombinacji z miesięcznych one-way (outbound + inbound).');
     // Pobierz miesięczne ceny dla TAM
-    const outMap = await getMonthlyFaresOneWay({
+      const outMap = await getMonthlyFaresOneWay({
       origin,
       destination,
       dateFrom: outFrom,
       dateTo: outTo,
       adults
+        ,departureFrom, departureTo
+        ,outboundDays: departureDays
     }, METRICS);
 
     // Pobierz miesięczne ceny dla POWRÓT - dla KAŻDEGO lotniska powrotu
     const inMapByAirport = new Map(); // Map<returnAirport, Map<date, price>>
     for (const returnAirport of returnAirports) {
-      const inMap = await getMonthlyFaresOneWay({
+        const inMap = await getMonthlyFaresOneWay({
         origin: destination,
         destination: returnAirport,
         dateFrom: outFrom,
         dateTo: outTo,
         adults
+          ,departureFrom: returnDepartureFrom, departureTo: returnDepartureTo
+          ,arrivalFrom: returnArrivalFrom, arrivalTo: returnArrivalTo
+          ,outboundDays: returnDays
       }, METRICS);
       if (inMap.size > 0) {
         inMapByAirport.set(returnAirport, inMap);
@@ -1096,6 +1339,7 @@ export async function searchRoundTripRange(params) {
     }
 
     if (outMap.size > 0 && inMapByAirport.size > 0) {
+      const candidateMargin = params.oneWayCandidateMargin || 1.3; // Domyślnie 30% buffer
       // Zbuduj pary w dozwolonym zakresie pobytu, filtruj po sumie <= maxPrice
       const outDates = Array.from(outMap.keys()).sort();
 
@@ -1117,7 +1361,7 @@ export async function searchRoundTripRange(params) {
             const total = (outMap.get(od) || 0) + (inMap.get(id) || 0); // Zakładamy PLN (market pl-pl)
             // Filtruj tylko oczywiste przepłacone pary (z dużym marginesem)
             // Miesięczne ceny to oszacowania - rzeczywiste mogą być niższe!
-            if (total > 0 && (!maxPrice || total <= maxPrice * 1.3)) {
+            if (total > 0 && (!maxPrice || total <= maxPrice * candidateMargin)) {
               oneWayCandidatePairs.push({
                 outDate: od,
                 inDate: id,
@@ -1136,8 +1380,14 @@ export async function searchRoundTripRange(params) {
       console.log(`📊 Znaleziono ${oneWayCandidatePairs.length} możliwych par do sprawdzenia (wszystkie lotniska razem).`);
 
       // Zbierz unikalne daty do pobrania
-      const neededOutDates = new Set(oneWayCandidatePairs.map(p => p.outDate));
-      const neededInDates = new Set(oneWayCandidatePairs.map(p => p.inDate));
+      const neededOutDates = new Set(oneWayCandidatePairs.map(p => p.outDate).filter(d => {
+        if (!departureDays || !Array.isArray(departureDays) || departureDays.length !== 7) return true;
+        return isDateMatchingDays(d, departureDays);
+      }));
+      const neededInDates = new Set(oneWayCandidatePairs.map(p => p.inDate).filter(d => {
+        if (!returnDays || !Array.isArray(returnDays) || returnDays.length !== 7) return true;
+        return isDateMatchingDays(d, returnDays);
+      }));
 
       // Pobierz/odczytaj z cache loty dla tych dat (TAM)
       const outboundByDate = new Map();
@@ -1154,7 +1404,9 @@ export async function searchRoundTripRange(params) {
         // Sprawdź cache NAJPIERW (bez opóźnienia)
         const cached = await getFlightsFromCache(origin, destination, d, adults);
         if (cached !== null) {
-          outboundByDate.set(d, cached);
+          const cachedWithSource = cached.map(f => ({ ...f, source: 'CACHE' }));
+          const filteredCached = applyTimeFiltersToFlights(cachedWithSource, { departureFrom, departureTo, arrivalFrom, arrivalTo });
+          outboundByDate.set(d, filteredCached);
           cachedOut++;
           outErrorsInARow = 0;
           continue; // Przejdź do następnej daty (bez delay)
@@ -1174,8 +1426,10 @@ export async function searchRoundTripRange(params) {
         while (!success && retries <= RATE_LIMIT_CONFIG.maxRetries) {
           try {
             const res = await searchFlights({ origin, destination, dateOut: d, adults }, METRICS);
-            await saveFlightsToCache(origin, destination, d, res, adults);
-            outboundByDate.set(d, res);
+            const resWithSource = res.map(f => ({ ...f, source: 'API' }));
+            await saveFlightsToCache(origin, destination, d, resWithSource, adults);
+            const filteredRes = applyTimeFiltersToFlights(resWithSource, { departureFrom, departureTo, arrivalFrom, arrivalTo });
+            outboundByDate.set(d, filteredRes);
             fetchedOut++;
             outErrorsInARow = 0;
             success = true;
@@ -1220,7 +1474,9 @@ export async function searchRoundTripRange(params) {
           // Sprawdź cache
           const cached = await getFlightsFromCache(destination, returnAirport, d, adults);
           if (cached !== null) {
-            flightsByAirport.set(returnAirport, cached);
+            const cachedWithSource = cached.map(f => ({ ...f, source: 'CACHE' }));
+            const filteredCached = applyTimeFiltersToFlights(cachedWithSource, { arrivalFrom: returnArrivalFrom, arrivalTo: returnArrivalTo });
+            flightsByAirport.set(returnAirport, filteredCached);
             cachedIn++;
             inErrorsInARow = 0;
             continue;
@@ -1241,8 +1497,10 @@ export async function searchRoundTripRange(params) {
           while (!success && retries <= RATE_LIMIT_CONFIG.maxRetries) {
             try {
               const res = await searchFlights({ origin: destination, destination: returnAirport, dateOut: d, adults }, METRICS);
-              await saveFlightsToCache(destination, returnAirport, d, res, adults);
-              flightsByAirport.set(returnAirport, res);
+              const resWithSource = res.map(f => ({ ...f, source: 'API' }));
+              await saveFlightsToCache(destination, returnAirport, d, resWithSource, adults);
+              const filteredRes = applyTimeFiltersToFlights(resWithSource, { arrivalFrom: returnArrivalFrom, arrivalTo: returnArrivalTo });
+              flightsByAirport.set(returnAirport, filteredRes);
               fetchedIn++;
               inErrorsInARow = 0;
               success = true;
@@ -1273,18 +1531,28 @@ export async function searchRoundTripRange(params) {
       let rejectedByTime = 0, rejectedByPrice = 0, rejectedByStayDays = 0;
 
       for (const p of oneWayCandidatePairs) {
-        const outs = (outboundByDate.get(p.outDate) || []).filter(f => f.priceInPLN != null);
+        const outs = (outboundByDate.get(p.outDate) || []).filter(f => f.priceInPLN != null && f.departure && f.arrival);
 
         // Pobierz loty powrotne dla daty
         const flightsByAirport = inboundByDateAndAirport.get(p.inDate);
-        if (!flightsByAirport || outs.length === 0) continue;
+        if (!flightsByAirport) {
+          console.log(`   ⚠️ Brak lotów POWRÓT dla daty ${p.inDate}`);
+          continue;
+        }
+        if (outs.length === 0) {
+          console.log(`   ⚠️ Brak lotów TAM dla daty ${p.outDate}`);
+          continue;
+        }
 
         // Pobierz loty dla KONKRETNEGO lotniska powrotu z pary
         const returnAirport = p.returnAirport;
         const insFlights = flightsByAirport.get(returnAirport);
-        if (!insFlights) continue;
+        if (!insFlights) {
+          console.log(`   ⚠️ Brak lotów POWRÓT dla lotniska ${returnAirport} w dacie ${p.inDate}`);
+          continue;
+        }
 
-        const ins = (insFlights || []).filter(f => f.priceInPLN != null);
+        const ins = (insFlights || []).filter(f => f.priceInPLN != null && f.departure && f.arrival);
         if (ins.length === 0) continue;
 
         // Sprawdź WSZYSTKIE kombinacje (lot TAM × lot POWRÓT z tego lotniska)
@@ -1298,12 +1566,14 @@ export async function searchRoundTripRange(params) {
 
             if (timeDiffHours < 7) {
               rejectedByTime++;
+              console.log(`   ❌ ODRZUCONO (czas<7h) [cheapCombin]: out ${outFlight.date} ${outFlight.arrival} (arr) - in ${inFlight.date} ${inFlight.departure} (dep); diff ${timeDiffHours.toFixed(2)}h; outPrice ${outFlight.priceInPLN}, inPrice ${inFlight.priceInPLN}; origin ${outFlight.origin} -> ${outFlight.destination} / return ${inFlight.origin}->${inFlight.destination} (returnAirport=${returnAirport})`);
               continue; // Pomiń - za mało czasu między przylotem a powrotem
             }
 
             const total = (outFlight.priceInPLN || 0) + (inFlight.priceInPLN || 0);
             if (maxPrice && total > maxPrice) {
               rejectedByPrice++;
+              console.log(`   ❌ ODRZUCONO (cena>max) [cheapCombin]: out ${outFlight.date} ${outFlight.arrival} + in ${inFlight.date} ${inFlight.departure} -> total ${total} PLN > ${maxPrice} PLN; origin ${outFlight.origin} -> ${outFlight.destination}; returnAirport=${returnAirport}`);
               // Debug dla par LCJ→AGP→POZ
               if (p.outDate === '2025-12-15' && p.inDate === '2025-12-18' && returnAirport === 'POZ') {
                 console.log(`   🔍 LCJ→AGP→POZ (15→18): ${outFlight.priceInPLN} + ${inFlight.priceInPLN} = ${total} PLN > ${maxPrice} PLN ❌`);
@@ -1322,7 +1592,9 @@ export async function searchRoundTripRange(params) {
               originAirport: outFlight.origin,
               originName: outFlight.originName || '',
               returnName: inFlight.destinationName || ''
+              , source: (outFlight.source === 'API' && inFlight.source === 'API') ? 'API' : (outFlight.source === 'CACHE' && inFlight.source === 'CACHE') ? 'CACHE' : 'MIXED'
             });
+            console.log(`   ✅ Zaakceptowano [cheapCombin]: ${outFlight.origin}->${outFlight.destination} ${p.outDate} (${outFlight.arrival}) + ${inFlight.origin}->${inFlight.destination} ${p.inDate} (${inFlight.departure}) = ${total} PLN; legSources: ${outFlight.source || 'UNKNOWN'}/${inFlight.source || 'UNKNOWN'}; comboSource: ${(outFlight.source === 'API' && inFlight.source === 'API') ? 'API' : (outFlight.source === 'CACHE' && inFlight.source === 'CACHE') ? 'CACHE' : 'MIXED'}`);
           }
         }
       }
@@ -1406,7 +1678,15 @@ export async function searchRoundTripRange(params) {
     for (const combo of cheapCombinations) {
       // Format: "outDate|inDate" (standard) lub "outDate|inDate|returnAirport" (multi-airport)
       const parts = combo.split('|');
-      cheapOutDates.add(parts[0]); // outDate zawsze pierwsza część
+      const outDate = parts[0];
+      // Apply departureDays filter if provided
+      if (departureDays && Array.isArray(departureDays) && departureDays.length === 7) {
+        if (isDateMatchingDays(outDate, departureDays)) {
+          cheapOutDates.add(outDate);
+        }
+      } else {
+        cheapOutDates.add(outDate);
+      }
     }
 
     console.log(`🎯 Szukam lotów TAM tylko dla ${cheapOutDates.size} tanich dni: ${Array.from(cheapOutDates).join(', ')}`);
@@ -1418,7 +1698,8 @@ export async function searchRoundTripRange(params) {
       const cachedFlights = await getFlightsFromCache(origin, destination, date, adults);
       if (cachedFlights !== null) {
         console.log(`  ✅ ${date}: ${cachedFlights.length} lotów z cache`);
-        outboundFlights.push(...cachedFlights);
+        const cachedWithSource = cachedFlights.map(f => ({ ...f, source: 'CACHE' }));
+        outboundFlights.push(...cachedWithSource);
         outCached++;
         continue; // Przejdź do następnej daty (bez delay)
       }
@@ -1442,8 +1723,9 @@ export async function searchRoundTripRange(params) {
             adults
           }, METRICS);
           console.log(`  📡 ${date}: ${flights.length} lotów z API`);
-          await saveFlightsToCache(origin, destination, date, flights, adults);
-          outboundFlights.push(...flights);
+          const flightsWithSource = flights.map(f => ({ ...f, source: 'API' }));
+          await saveFlightsToCache(origin, destination, date, flightsWithSource, adults);
+          outboundFlights.push(...flightsWithSource);
           outFetched++;
           success = true;
         } catch (error) {
@@ -1470,7 +1752,12 @@ export async function searchRoundTripRange(params) {
       dateFrom: outFrom,
       dateTo: outTo,
       adults
+      ,departureFrom, departureTo
+      ,arrivalFrom, arrivalTo
+      ,departureDays
     }, METRICS); // Przekaż METRICS
+    // Upewnij się, że każde lot ma oznaczenie źródła
+    outboundFlights = outboundFlights.map(f => ({ ...f, source: f.source || 'CACHE' }));
   }
 
   console.log(`Znaleziono ${outboundFlights.length} lotów TAM`);
@@ -1489,6 +1776,12 @@ export async function searchRoundTripRange(params) {
       // Multi-airport: parts[2] = returnAirport, standardowy: brak parts[2] → używamy origin
       const returnAirport = parts.length === 3 ? parts[2] : origin;
 
+      // Apply returnDays filter if provided
+      if (returnDays && Array.isArray(returnDays) && returnDays.length === 7) {
+        if (!isDateMatchingDays(inDate, returnDays)) {
+          continue; // skip this inDate because it's not in selected return days
+        }
+      }
       if (!cheapInPairs.has(returnAirport)) {
         cheapInPairs.set(returnAirport, new Set());
       }
@@ -1507,7 +1800,8 @@ export async function searchRoundTripRange(params) {
         const cachedFlights = await getFlightsFromCache(destination, returnAirport, date, adults);
         if (cachedFlights !== null) {
           console.log(`  ✅ ${date} (→${returnAirport}): ${cachedFlights.length} lotów z cache`);
-          inboundFlights.push(...cachedFlights);
+          const cachedWithSource = cachedFlights.map(f => ({ ...f, source: 'CACHE' }));
+          inboundFlights.push(...cachedWithSource);
           inCached++;
           continue; // Przejdź do następnej daty (bez delay)
         }
@@ -1531,8 +1825,9 @@ export async function searchRoundTripRange(params) {
               adults
             }, METRICS); // Przekaż METRICS
             console.log(`  📡 ${date} (→${returnAirport}): ${flights.length} lotów z API`);
-            await saveFlightsToCache(destination, returnAirport, date, flights, adults);
-            inboundFlights.push(...flights);
+            const flightsWithSource = flights.map(f => ({ ...f, source: 'API' }));
+            await saveFlightsToCache(destination, returnAirport, date, flightsWithSource, adults);
+            inboundFlights.push(...flightsWithSource);
             inFetched++;
             success = true;
           } catch (error) {
@@ -1561,8 +1856,12 @@ export async function searchRoundTripRange(params) {
         dateFrom: outFrom,
         dateTo: outTo,
         adults
+        ,departureFrom: returnDepartureFrom, departureTo: returnDepartureTo
+        ,arrivalFrom: returnArrivalFrom, arrivalTo: returnArrivalTo
+        ,departureDays: returnDays
       }, METRICS); // Przekaż METRICS
-      inboundFlights.push(...flights);
+      // Upewnij się, że każde lot ma oznaczenie źródła
+      inboundFlights.push(...flights.map(f => ({ ...f, source: f.source || 'CACHE' })));
     }
   }
 
@@ -1576,6 +1875,8 @@ export async function searchRoundTripRange(params) {
 
   for (const outFlight of outboundFlights) {
     for (const inFlight of inboundFlights) {
+      // Require valid time fields (defensive)
+      if (!outFlight.departure || !outFlight.arrival || !inFlight.departure || !inFlight.arrival) continue;
       const outDate = new Date(outFlight.date);
       const inDate = new Date(inFlight.date);
 
@@ -1596,6 +1897,7 @@ export async function searchRoundTripRange(params) {
 
       if (timeDiffHours < 7) {
         rejectedByTime++;
+        console.log(`   ❌ ODRZUCONO (czas<7h) [fullScan]: out ${outFlight.date} ${outFlight.arrival} (arr) - in ${inFlight.date} ${inFlight.departure} (dep); diff ${timeDiffHours.toFixed(2)}h; outPrice ${outFlight.priceInPLN}, inPrice ${inFlight.priceInPLN}; origin ${outFlight.origin} -> return ${inFlight.origin}`);
         continue; // Pomiń - za mało czasu między przylotem a powrotem
       }
 
@@ -1614,6 +1916,7 @@ export async function searchRoundTripRange(params) {
         // ale w konkretne godziny mogą być droższe loty). Zamiast tego filtrujemy po realnej cenie.
         if (maxPrice && totalPriceInPLN > maxPrice) {
           rejectedByCombo++; // rejectedByPrice byłoby lepsze, ale zostawiamy nazwę dla zgodności z logami
+          console.log(`   ❌ ODRZUCONO (cena>max) [fullScan]: out ${outFlight.date} ${outFlight.arrival} + in ${inFlight.date} ${inFlight.departure} -> total ${totalPriceInPLN} PLN > ${maxPrice}; origin ${outFlight.origin} -> return ${inFlight.origin}`);
           continue;
         }
 
@@ -1628,9 +1931,13 @@ export async function searchRoundTripRange(params) {
           returnAirport: inFlight.destination,
           originName: outFlight.originName || '',
           returnName: inFlight.destinationName || ''
+          , source: (outFlight.source === 'API' && inFlight.source === 'API') ? 'API' : (outFlight.source === 'CACHE' && inFlight.source === 'CACHE') ? 'CACHE' : 'MIXED'
         });
+        console.log(`   ✅ Zaakceptowano [fullScan]: ${outFlight.origin}->${outFlight.destination} ${outFlight.date} (${outFlight.arrival}) + ${inFlight.origin}->${inFlight.destination} ${inFlight.date} (${inFlight.departure}) = ${totalPriceInPLN} PLN; legSources: ${outFlight.source || 'UNKNOWN'}/${inFlight.source || 'UNKNOWN'}; comboSource: ${(outFlight.source === 'API' && inFlight.source === 'API') ? 'API' : (outFlight.source === 'CACHE' && inFlight.source === 'CACHE') ? 'CACHE' : 'MIXED'}`);
+        console.log(`   ✅ Zaakceptowano [fullScan]: ${outFlight.origin}->${outFlight.destination} ${outFlight.date} (${outFlight.arrival}) + ${inFlight.origin}->${inFlight.destination} ${inFlight.date} (${inFlight.departure}) = ${totalPriceInPLN} PLN; source: ${outFlight.source || 'UNKNOWN'}/${inFlight.source || 'UNKNOWN'}`);
       } else {
         rejectedByStay++;
+        console.log(`   ❌ ODRZUCONO (pobyt poza zakresem) [fullScan]: out ${outFlight.date} -> in ${inFlight.date} = ${stayDays} dni; allowed ${stayDaysMin}-${stayDaysMax}; origin ${outFlight.origin}`);
       }
     }
   }
@@ -1646,84 +1953,7 @@ export async function searchRoundTripRange(params) {
     return a.totalPriceInPLN - b.totalPriceInPLN;
   });
 
-  // Fallback syntetyczny: jeśli FareFinder znalazł tanie kombinacje, ale realne loty (API /search) zwróciły 0
-  // WAŻNE: uruchamia się ZAWSZE gdy combinations === 0, nawet jeśli inne lotniska mają wyniki
-  if (combinations.length === 0 && useFareFinderOptimization && monthlyRawData && Array.isArray(monthlyRawData.fares)) {
-    const synthetic = [];
-    const toTime = (iso) => {
-      try { return iso?.substring(11,16) || null; } catch { return null; }
-    };
-    const toDate = (iso) => {
-      try { return iso?.split('T')[0]; } catch { return null; }
-    };
-    for (const fare of monthlyRawData.fares) {
-      const outDepISO = fare?.outbound?.departureDate;
-      const outArrISO = fare?.outbound?.arrivalDate || fare?.outbound?.departureDate;
-      const inDepISO = fare?.inbound?.departureDate;
-      const inArrISO = fare?.inbound?.arrivalDate || fare?.inbound?.departureDate;
-      const totalPLN = Number(fare?.summary?.price?.value) || 0;
-
-      if (!outDepISO || !inDepISO || totalPLN <= 0) continue;
-      if (maxPrice && totalPLN > maxPrice) continue;
-
-      // Walidacje: 7h między przylotem a powrotem oraz stayDays w zakresie
-      const outArrival = new Date(outArrISO);
-      const inDeparture = new Date(inDepISO);
-      const hoursDiff = (inDeparture - outArrival) / (1000*60*60);
-      if (hoursDiff < 7) continue;
-
-      const outDateOnly = new Date(toDate(outDepISO));
-      const inDateOnly = new Date(toDate(inDepISO));
-      const stayDays = Math.round((inDateOnly - outDateOnly) / (1000*60*60*24)) + 1;
-      if (stayDays < stayDaysMin || stayDays > stayDaysMax) continue;
-
-      // Syntetyczne obiekty lotów (minimalne pola używane przez UI)
-      const outbound = {
-        date: toDate(outDepISO),
-        departure: toTime(outDepISO),
-        arrival: toTime(outArrISO),
-        flightNumber: fare?.outbound?.flightNumber || '',
-        duration: '',
-        priceInPLN: Math.round((Number(fare?.outbound?.price?.value) || 0) * 100) / 100,
-        price: Number(fare?.outbound?.price?.value) || 0,
-        currency: fare?.outbound?.price?.currencyCode || 'PLN',
-        operatedBy: 'Ryanair',
-        synthetic: true
-      };
-      const inbound = {
-        date: toDate(inDepISO),
-        departure: toTime(inDepISO),
-        arrival: toTime(inArrISO),
-        flightNumber: fare?.inbound?.flightNumber || '',
-        duration: '',
-        priceInPLN: Math.round((Number(fare?.inbound?.price?.value) || 0) * 100) / 100,
-        price: Number(fare?.inbound?.price?.value) || 0,
-        currency: fare?.inbound?.price?.currencyCode || 'PLN',
-        operatedBy: 'Ryanair',
-        synthetic: true,
-        destination: fare?.inbound?.arrivalAirport?.code || '',
-        destinationName: fare?.inbound?.arrivalAirport?.name || ''
-      };
-
-      synthetic.push({
-        outbound,
-        inbound,
-        totalPriceInPLN: Math.round(totalPLN * 100) / 100,
-      	stayDays,
-        outDate: outbound.date,
-        inDate: inbound.date,
-        synthetic: true,
-        returnAirport: fare?.inbound?.arrivalAirport?.code || inbound.destination || '',
-        returnName: fare?.inbound?.arrivalAirport?.name || inbound.destinationName || ''
-      });
-    }
-
-    if (synthetic.length > 0) {
-      synthetic.sort((a,b) => a.totalPriceInPLN - b.totalPriceInPLN);
-      console.log(`🧩 Fallback syntetyczny: dodano ${synthetic.length} kombinacji z FareFinder (brak potwierdzonych lotów z /search)`);
-      combinations.push(...synthetic);
-    }
-  }
+  // Synthetic fallback removed: we only return combinations created from actual API results
 
   // Już przefiltrowane w pętli powyżej, więc nie trzeba ponownie
   let filtered = combinations;
@@ -1786,6 +2016,7 @@ function parseFlights(data, tripIndex = 0) {
         price: null,
         currency: data.currency || 'PLN',
         priceInPLN: null, // Będzie wyliczone poniżej
+        source: 'API', // default when parsing actual API search results
         faresLeft: flight.faresLeft || 0,
         infantsLeft: flight.infantsLeft || 0,
         operatedBy: flight.operatedBy || 'Ryanair'
@@ -1835,6 +2066,31 @@ export async function getAirports(market = 'pl') {
   } catch (error) {
     console.error('Błąd pobierania lotnisk:', error);
     if (error?.hardBlocked) throw error;
+    return [];
+  }
+}
+
+/**
+ * Pobierz listę destynacji (IATA) dla lotniska (LOCATE)
+ * @param {string} origin - kod IATA lotniska
+ * @param {string} market - rynek (pl-pl domyślnie)
+ * @returns {Promise<Array<string>>} lista kodów IATA destynacji (np. ["AGP", "ALC"]) lub []
+ */
+export async function getRoutes(origin, market = 'pl-pl') {
+  try {
+    const response = await safeRyanairFetch(`${BACKEND_API}/ryanair/routes?origin=${origin}&market=${market}`, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' }
+    });
+    if (!response.ok) {
+      console.warn(`Nie udało się pobrać routes dla ${origin} (status: ${response.status})`);
+      return [];
+    }
+    const data = await response.json();
+    return data.destinations || [];
+  } catch (e) {
+    console.error('Błąd getRoutes:', e);
+    if (e?.hardBlocked) throw e;
     return [];
   }
 }
@@ -1961,20 +2217,44 @@ export async function getAvailableDates(origin, destination, market = 'pl-pl') {
 /**
  * Wyszukaj loty do dowolnego kierunku (ANY destination)
  */
-export async function searchAnyDestination(params) {
-  const { origin, dateFrom, dateTo, adults = 1, market = 'pl-pl' } = params;
+export async function searchAnyDestination(params, priceLimit = null) {
+  // priceLimit = maximum price (PLN) — filter out fares with priceInPLN > priceLimit
+  const { origin, dateFrom, dateTo, adults = 1, market = 'pl-pl', departureFrom = '00:00', departureTo = '23:59' } = params;
 
   console.log('🔍 searchAnyDestination wywołane:', params);
 
   try {
+    const cacheKey = `any:${origin}:${dateFrom}:${dateTo}:${adults}:${market}:${priceLimit ?? 'null'}`;
+    // Check in-memory cache
+    if (globalThis.__anyDestCache && globalThis.__anyDestCache.has(cacheKey)) {
+      const entry = globalThis.__anyDestCache.get(cacheKey);
+      if (entry.expires > Date.now()) {
+        if (entry.result) {
+          console.log('💾 searchAnyDestination cache hit:', cacheKey);
+          // Ensure cached flights have proper 'source' annotations
+          if (entry.result.fares && Array.isArray(entry.result.fares)) {
+            entry.result.fares = entry.result.fares.map(far => ({
+              ...far,
+              flights: Array.isArray(far.flights) ? far.flights.map(x => ({ ...x, source: x.source || 'CACHE' })) : far.flights
+            }));
+          }
+          return entry.result;
+        }
+      } else {
+        globalThis.__anyDestCache.delete(cacheKey);
+      }
+    }
     const queryParams = new URLSearchParams({
       departureAirportIataCode: origin,
       outboundDepartureDateFrom: dateFrom,
       outboundDepartureDateTo: dateTo,
+      outboundDepartureTimeFrom: departureFrom,
+      outboundDepartureTimeTo: departureTo,
       adultPaxCount: adults,
       market: market,
       searchMode: 'ALL'
     });
+    if (priceLimit) queryParams.set('maxPrice', String(priceLimit));
 
     // Miękki limiter (600±200ms)
     await smartDelay();
@@ -1998,32 +2278,48 @@ export async function searchAnyDestination(params) {
 
     // Parsuj dane - grupuj po destynacjach
     const destinations = {};
-    if (data.fares && Array.isArray(data.fares)) {
+        if (data.fares && Array.isArray(data.fares)) {
       console.log('🔍 Parsuję', data.fares.length, 'fare\'ów');
       data.fares.forEach((fare, index) => {
         console.log(`Fare ${index}:`, JSON.stringify(fare).substring(0, 200));
-        const dest = fare.outbound?.arrivalAirport?.iataCode;
-        const price = fare.outbound?.price?.value || 0;
+  const dest = fare.outbound?.arrivalAirport?.iataCode;
+  const rawPriceObj = fare.outbound?.price;
+  const price = (rawPriceObj?.value ?? rawPriceObj?.amount) || 0;
         const date = fare.outbound?.departureDate?.split('T')[0];
 
         console.log(`  Dest: ${dest}, Price: ${price}, Date: ${date}`);
 
+        // We no longer filter based on confirmation; accept all API-provided fares
         if (dest && price > 0) {
           if (!destinations[dest]) {
             destinations[dest] = {
               destination: dest,
               destinationName: fare.outbound?.arrivalAirport?.name || dest,
-              minPrice: price,
+              minPrice: convertToPLN(price, rawPriceObj?.currencyCode || rawPriceObj?.currency || 'PLN') || price,
               flights: []
             };
           }
 
-          destinations[dest].minPrice = Math.min(destinations[dest].minPrice, price);
-          destinations[dest].flights.push({
+          destinations[dest].minPrice = Math.min(destinations[dest].minPrice, convertToPLN(price, rawPriceObj?.currencyCode || rawPriceObj?.currency || 'PLN') || price);
+          const currency = rawPriceObj?.currencyCode || rawPriceObj?.currency || 'PLN';
+          // Build a flight object and apply departure-time filter (outbound)
+          const flightObj = {
             date,
             price,
-            currency: fare.outbound?.price?.currencyCode || 'PLN'
-          });
+            currency,
+            priceInPLN: convertToPLN(price, currency),
+            originAirport: origin,
+            source: fare.source || 'API',
+            departure: fare.outbound?.departureTime?.split('T')?.[1]?.slice(0,5) || fare.outbound?.time || null,
+            arrival: fare.outbound?.arrivalTime?.split('T')?.[1]?.slice(0,5) || null
+          };
+          if (departureFrom || departureTo) {
+            if (isTimeBetween(flightObj.departure, departureFrom, departureTo)) {
+              destinations[dest].flights.push(flightObj);
+            }
+          } else {
+            destinations[dest].flights.push(flightObj);
+          }
         } else {
           console.log(`  ⚠️ Pominęto fare - dest: ${dest}, price: ${price}`);
         }
@@ -2033,6 +2329,13 @@ export async function searchAnyDestination(params) {
     }
 
     const result = Object.values(destinations);
+    // Store in cache for 30 minutes
+    try {
+      if (!globalThis.__anyDestCache) globalThis.__anyDestCache = new Map();
+      globalThis.__anyDestCache.set(cacheKey, { result, expires: Date.now() + 30 * 60 * 1000 });
+    } catch (e) {
+      // ignore cache errors
+    }
     console.log('✅ searchAnyDestination zwraca:', result.length, 'destynacji');
     return result;
   } catch (error) {

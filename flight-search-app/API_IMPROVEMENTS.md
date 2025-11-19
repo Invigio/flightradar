@@ -149,6 +149,12 @@ const destinations = await searchAnyDestination({
   adults: 1
 });
 // Zwraca: [{destination: 'AGP', minPrice: 150, flights: [...]}]
+
+### 5. **Zmiana dot. potwierdzania cen**
+
+- Usunięto automatyczne potwierdzanie cen przez Search API (potwierdzenie było wolne i powodowało filtrowanie wyników).
+- Nie stosujemy również syntetycznego łączenia FareFinder (które mogło tworzyć niepotwierdzone kombinacje). Zwracamy tylko ceny i kombinacje pochodzące bezpośrednio z API.
+// Zwraca: [{destination: 'AGP', minPrice: 150, flights: [...]}]
 ```
 
 ---

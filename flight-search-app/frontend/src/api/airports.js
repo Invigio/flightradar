@@ -3,7 +3,7 @@
  */
 
 import { safeRyanairFetch, isRyanairBlocked } from './ryanair';
-const BACKEND_API = import.meta.env.VITE_BACKEND_API || 'http://localhost:8000/api';
+const BACKEND_API = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
 
 /**
  * Pobiera WSZYSTKIE lotniska z bazy danych (dla wyboru źródła)
@@ -197,8 +197,19 @@ export function searchAirports(airports, searchText) {
  * @returns {Promise<string[]>} - Tablica kodów lotnisk docelowych
  */
 export async function getRoutesFromAirport(airportCode) {
-  const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
-  const url = `${BACKEND_URL}/api/ryanair/routes?origin=${airportCode}&market=pl-pl`;
+  // session in-memory cache
+  if (!globalThis.__routesCache) globalThis.__routesCache = new Map();
+  const cacheKey = `routes:${airportCode}`;
+  if (globalThis.__routesCache.has(cacheKey)) {
+    const entry = globalThis.__routesCache.get(cacheKey);
+    if (entry.expires > Date.now()) {
+      console.log(`💾 routes cache hit for ${airportCode}`);
+      return entry.routes;
+    } else {
+      globalThis.__routesCache.delete(cacheKey);
+    }
+  }
+  const url = `${BACKEND_API.replace(/\/+$|\/api$/, '')}/api/ryanair/routes?origin=${airportCode}&market=pl-pl`;
 
   console.log(`🔍 Sprawdzam dostępne połączenia z ${airportCode}...`);
 
@@ -213,6 +224,8 @@ export async function getRoutesFromAirport(airportCode) {
 
     if (data.destinations && Array.isArray(data.destinations)) {
       console.log(`✅ Znaleziono ${data.destinations.length} połączeń z ${airportCode}`);
+      // store in cache, expire 12h
+      globalThis.__routesCache.set(cacheKey, { routes: data.destinations, expires: Date.now() + 12 * 60 * 60 * 1000 });
       return data.destinations;
     }
 

@@ -4,7 +4,7 @@
  */
 import React, { useState, useEffect } from 'react';
 import { Search, Calendar, Users, Plane, MapPin } from 'lucide-react';
-import { searchFlightsRange, searchRoundTripRange, getLastMetrics, isRyanairBlocked, resetRyanairLimiter } from '../api/ryanair';
+import { searchFlightsRange, searchRoundTripRange, getLastMetrics, isRyanairBlocked, resetRyanairLimiter, debugCheckPair } from '../api/ryanair';
 import { searchAnyDestination } from '../api/ryanair';
 import { searchHistory } from '../api/backend';
 import {
@@ -15,6 +15,8 @@ import {
   searchAirports,
   getRoutesFromAirport
 } from '../api/airports';
+import { getMonthlyFaresForRoute } from '../api/ryanair';
+import { minutesToTime, timeToMinutes } from '../utils/time';
 import { useFlightStore } from '../store';
 import { useAuthStore } from '../store';
 import toast from 'react-hot-toast';
@@ -22,6 +24,7 @@ import toast from 'react-hot-toast';
 export default function SearchForm() {
   // Pobierz setter do ustawiania wyników lotów w globalnym store
   const setFlights = useFlightStore(state => state.setFlights);
+  const setStoreMetrics = useFlightStore(state => state.setMetrics);
   // Stan dla parametrów ostatniego wyszukiwania
   const [searchParams, setSearchParams] = useState(null);
   // Stan dla błędów wyszukiwania
@@ -32,6 +35,113 @@ export default function SearchForm() {
   const [stayDaysMax, setStayDaysMax] = useState(7);
   // Stan dla minimalnej liczby dni pobytu
   const [stayDaysMin, setStayDaysMin] = useState(1);
+  // Time filters (HH:MM)
+  const [departureFrom, setDepartureFrom] = useState('00:00');
+  const [departureTo, setDepartureTo] = useState('23:59');
+  const [returnArrivalFrom, setReturnArrivalFrom] = useState('00:00');
+  const [arrivalFrom, setArrivalFrom] = useState('00:00');
+  const [arrivalTo, setArrivalTo] = useState('23:59');
+  const [returnArrivalTo, setReturnArrivalTo] = useState('23:59');
+  // Helpers: imported from utils/time
+  const [arrivalFromMin, setArrivalFromMin] = useState(0);
+  const [arrivalToMin, setArrivalToMin] = useState(23*60+59);
+  // Sliders internal state (minutes from midnight)
+  const [departureFromMin, setDepartureFromMin] = useState(0);
+  const [returnDepartureFrom, setReturnDepartureFrom] = useState('00:00');
+  const [returnDepartureTo, setReturnDepartureTo] = useState('23:59');
+  const [departureToMin, setDepartureToMin] = useState(23*60+59);
+  const [returnArrivalFromMin, setReturnArrivalFromMin] = useState(0);
+  const [returnDepartureFromMin, setReturnDepartureFromMin] = useState(0);
+  const [returnDepartureToMin, setReturnDepartureToMin] = useState(23*60+59);
+  const [returnArrivalToMin, setReturnArrivalToMin] = useState(23*60+59);
+
+  // Sync minutes to HH:MM when time inputs change
+  useEffect(() => {
+    const df = timeToMinutes(departureFrom);
+    const dt = timeToMinutes(departureTo);
+    const rf = timeToMinutes(returnArrivalFrom);
+    const rt = timeToMinutes(returnArrivalTo);
+    if (departureFromMin !== df) setDepartureFromMin(df);
+    const af = timeToMinutes(arrivalFrom);
+    const at = timeToMinutes(arrivalTo);
+    if (arrivalFromMin !== af) setArrivalFromMin(af);
+    if (arrivalToMin !== at) setArrivalToMin(at);
+    if (departureToMin !== dt) setDepartureToMin(dt);
+    if (returnArrivalFromMin !== rf) setReturnArrivalFromMin(rf);
+    if (returnArrivalToMin !== rt) setReturnArrivalToMin(rt);
+  }, [departureFrom, departureTo, arrivalFrom, arrivalTo, returnArrivalFrom, returnArrivalTo]);
+
+  // Sync HH:MM to minutes when slider inputs change
+  useEffect(() => {
+    const dfStr = minutesToTime(departureFromMin);
+    const dtStr = minutesToTime(departureToMin);
+    const rfStr = minutesToTime(returnArrivalFromMin);
+    const afStr = minutesToTime(arrivalFromMin);
+    const atStr = minutesToTime(arrivalToMin);
+    if (arrivalFrom !== afStr) setArrivalFrom(afStr);
+    if (arrivalTo !== atStr) setArrivalTo(atStr);
+    const rtStr = minutesToTime(returnArrivalToMin);
+    if (departureFrom !== dfStr) setDepartureFrom(dfStr);
+    const rdf = timeToMinutes(returnDepartureFrom);
+    const rdt = timeToMinutes(returnDepartureTo);
+    if (returnDepartureFromMin !== rdf) setReturnDepartureFromMin(rdf);
+    if (returnDepartureToMin !== rdt) setReturnDepartureToMin(rdt);
+    // sync minutes -> strings for return departure too
+    const rdfStr = minutesToTime(returnDepartureFromMin);
+    const rdtStr = minutesToTime(returnDepartureToMin);
+    if (returnDepartureFrom !== rdfStr) setReturnDepartureFrom(rdfStr);
+    if (returnDepartureTo !== rdtStr) setReturnDepartureTo(rdtStr);
+    if (departureTo !== dtStr) setDepartureTo(dtStr);
+    if (returnArrivalFrom !== rfStr) setReturnArrivalFrom(rfStr);
+    if (returnArrivalTo !== rtStr) setReturnArrivalTo(rtStr);
+  }, [departureFromMin, departureToMin, returnArrivalFromMin, returnArrivalToMin, arrivalFromMin, arrivalToMin, returnDepartureFromMin, returnDepartureToMin]);
+
+  // compute slider background gradient for range inputs
+  function rangeTrackStyle(minVal, maxVal) {
+    const minPct = (minVal / 1439) * 100;
+    const maxPct = (maxVal / 1439) * 100;
+    const color = '#2563EB'; // blue-600
+    const bg = `linear-gradient(90deg, #E5E7EB ${minPct}%, ${color} ${minPct}%, ${color} ${maxPct}%, #E5E7EB ${maxPct}%)`;
+    return { background: bg };
+  }
+  function rangeLabel(minVal, maxVal) {
+    if (minVal === 0 && maxVal === 1439) return 'Cały dzień';
+    return `od ${minutesToTime(minVal)} do ${minutesToTime(maxVal)}`;
+  }
+  function setRangeFullDay(which) {
+    switch (which) {
+      case 'departure':
+        setDepartureFromMin(0);
+        setDepartureToMin(1439);
+        setDepartureFrom('00:00');
+        setDepartureTo('23:59');
+        break;
+      case 'arrival':
+        setArrivalFromMin(0);
+        setArrivalToMin(1439);
+        setArrivalFrom('00:00');
+        setArrivalTo('23:59');
+        break;
+      case 'returnDeparture':
+        setReturnDepartureFromMin(0);
+        setReturnDepartureToMin(1439);
+        setReturnDepartureFrom('00:00');
+        setReturnDepartureTo('23:59');
+        break;
+      case 'returnArrival':
+        setReturnArrivalFromMin(0);
+        setReturnArrivalToMin(1439);
+        setReturnArrivalFrom('00:00');
+        setReturnArrivalTo('23:59');
+        break;
+      default:
+        break;
+    }
+  }
+  // Days of week filters: array of booleans for Mon..Sun indexes 1..7 (Date.getDay() -> 0..6 with 0=Sunday)
+  const [departureDays, setDepartureDays] = useState([true, true, true, true, true, true, true]); // Mon-Sun default true
+  const [returnDays, setReturnDays] = useState([true, true, true, true, true, true, true]); // Mon-Sun default true
+  // Day toggles (Mon..Sun boolean arrays) - allow arbitrary selection via buttons
     // Stan dla metryk
     const [metrics, setMetrics] = useState(null);
     // Tymczasowa deklaracja autoryzacji (do poprawy na hook/store)
@@ -45,6 +155,13 @@ export default function SearchForm() {
   const [adults, setAdults] = useState(1);
   // Stan dla maksymalnej ceny
   const [maxPrice, setMaxPrice] = useState('');
+  // Aggressive FareFinder mode: larger margin when deriving candidates from monthly one-way estimates
+  const [aggressiveMode, setAggressiveMode] = useState(false);
+  // Debug pair inputs
+  const [debugOutDate, setDebugOutDate] = useState('');
+  const [debugInDate, setDebugInDate] = useState('');
+  const [debugReturnAirport, setDebugReturnAirport] = useState('');
+  // Confirmation removed - we no longer verify prices via Search API
   // KLUCZOWE: tripType musi być zadeklarowany PRZED jakimkolwiek użyciem (np. w useEffect)
   const [tripType, setTripType] = useState('oneway'); // 'oneway' | 'round'
   // Stany dla dat wylotu i powrotu
@@ -72,6 +189,8 @@ export default function SearchForm() {
     }
   }, [tripType]);
   const [countryAvailableDestinations, setCountryAvailableDestinations] = useState([]); // Dostępne cele z kraju
+  const [countryRoutesByAirport, setCountryRoutesByAirport] = useState({});
+  const [countryMonthlyFaresByAirport, setCountryMonthlyFaresByAirport] = useState({});
 
   // Stany dla postępu wyszukiwania z wielu lotnisk
   const [searchProgress, setSearchProgress] = useState({ current: 0, total: 0, currentAirport: '' });
@@ -104,6 +223,11 @@ export default function SearchForm() {
     }
     loadAirports();
   }, []);
+
+  // Using independent circle toggles for day-of-week selection (Mon..Sun). No start/end selectors are used.
+
+  // Previously we synced toggles with separate start/end selectors.
+  // Now we use independent circle toggles only; no select-driven day ranges.
 
   // Zamknij dropdowny po kliknięciu poza nimi
   useEffect(() => {
@@ -180,10 +304,18 @@ export default function SearchForm() {
         const destinationAirports = allAirports.filter(a => uniqueDestinations.has(a.code));
 
         console.log(`✅ Znaleziono ${destinationAirports.length} unikalnych celów z kraju ${originCountry}`);
+        // Build map of routes by airport code for quick lookup
+        const routesMap = {};
+        for (let i = 0; i < countryAirports.length; i++) {
+          routesMap[countryAirports[i].code] = allRoutesArrays[i] || [];
+        }
+        setCountryRoutesByAirport(routesMap);
         setCountryAvailableDestinations(destinationAirports);
       } catch (error) {
         console.error('❌ Błąd pobierania dostępnych celów z kraju:', error);
         setCountryAvailableDestinations([]);
+        setCountryRoutesByAirport({});
+        setCountryMonthlyFaresByAirport({});
       } finally {
         setLoadingDestinations(false);
       }
@@ -191,6 +323,43 @@ export default function SearchForm() {
 
     loadCountryDestinations();
   }, [searchFromCountry, originCountry, allAirports]);
+
+  // Prefetch monthly fares per airport when destination and date range are set
+  useEffect(() => {
+    async function prefetchMonthlyFares() {
+      if (!searchFromCountry || !originCountry || !destination) return;
+      if (!maxPrice) return; // only prefetch monthly fares when maxPrice is set to optimize request count
+      const countryAirports = allAirports.filter(a => a.country.code === originCountry);
+      const map = {};
+      // Limit concurrency to 6 to speed up prefetch (adjust if you see rate-limiting)
+      const concurrency = 6;
+      const queue = [...countryAirports];
+      const workers = [];
+      for (let i = 0; i < concurrency; i++) {
+        workers.push((async () => {
+          while (queue.length > 0) {
+            const airport = queue.shift();
+            try {
+              const originCode = airport.code;
+              // Only fetch if this airport actually has the destination route
+              if (countryRoutesByAirport && countryRoutesByAirport[originCode] && !countryRoutesByAirport[originCode].includes(destination.toUpperCase())) {
+                continue;
+              }
+              const monthly = await getMonthlyFaresForRoute({ origin: originCode, destination: destination, dateFrom, dateTo, adults, departureFrom, departureTo, arrivalFrom, arrivalTo, outboundDays: departureDays });
+              // monthly is Map or object - ensure we store Map<date,price>
+              map[originCode] = monthly && monthly.prices ? monthly.prices : monthly || new Map();
+            } catch (e) {
+              console.warn('⚠️ Prefetch monthly fares error for', airport.code, e?.message || e);
+            }
+          }
+        })());
+      }
+      await Promise.all(workers);
+      setCountryMonthlyFaresByAirport(map);
+    }
+
+    prefetchMonthlyFares();
+  }, [searchFromCountry, originCountry, destination, dateFrom, dateTo, allAirports, countryRoutesByAirport, adults]);
 
   // Oblicz maksymalną długość pobytu na podstawie zakresu dat
   const getMaxStayDays = () => {
@@ -255,8 +424,8 @@ export default function SearchForm() {
     setError(null);
 
     try {
-    let flights = [];
-    let allFlightsFromCountry = [];
+      let flights = [];
+      let allFlightsFromCountry = [];
 
       // Parametry wyszukiwania dla historii
       const searchParamsForHistory = {
@@ -286,34 +455,127 @@ export default function SearchForm() {
           console.log(`🔍 Wyszukiwanie z ${airport.code} (${airport.name})`);
           setSearchProgress({ current: i + 1, total: countryAirports.length, currentAirport: airport.code });
           if (cancelSearch) break;
-          try {
-            const combos = await searchAnyDestination({
-              origin: airport.code,
-              dateFrom,
-              dateTo,
-              adults,
-              market: 'pl-pl'
-            });
-            console.log(`✅ Z ${airport.code} znaleziono ${combos.length} destynacji`);
-            combos.forEach(c => {
-              c.originAirport = airport.code;
-              c.originName = airport.name;
-              // Uzupełnij returnName jeśli brakuje
-              if (c.returnAirport && (!c.returnName || c.returnName === '')) {
-                c.returnName = airportNameByCode[c.returnAirport] || c.returnAirport;
+          // Prefilter: use cached routes map instead of calling API again
+          const routesForThisAirport = countryRoutesByAirport && countryRoutesByAirport[airport.code] ? countryRoutesByAirport[airport.code] : null;
+          if (routesForThisAirport && !routesForThisAirport.includes(destination.toUpperCase())) {
+            console.log(`   ⚠️ ${airport.code} nie ma połączenia do ${destination}, pomijam.`);
+            continue; // skip this airport
+          }
+          // Additional optimization: if maxPrice is set and we have monthly fares cached, skip airports where no date <= maxPrice
+          if (maxPrice && countryMonthlyFaresByAirport && countryMonthlyFaresByAirport[airport.code]) {
+            try {
+              const priceMap = countryMonthlyFaresByAirport[airport.code];
+              // priceMap may be Map or object - normalize to iteration
+              let foundCheap = false;
+              if (priceMap instanceof Map) {
+                for (const val of priceMap.values()) {
+                  if (val <= Number(maxPrice)) { foundCheap = true; break; }
+                }
+              } else if (typeof priceMap === 'object') {
+                for (const k in priceMap) {
+                  if (Object.prototype.hasOwnProperty.call(priceMap, k) && priceMap[k] <= Number(maxPrice)) { foundCheap = true; break; }
+                }
               }
-            });
-            allResults.push(...combos);
+              if (!foundCheap) {
+                console.log(`   ⚠️ ${airport.code} nie ma dni ≤ ${maxPrice} PLN według miesięcznych cen, pomijam.`);
+                continue;
+              }
+            } catch (e) {
+              console.warn('   ⚠️ Błąd analizowania monthly fares:', e?.message || e);
+            }
+          }
+          try {
+            if (tripType === 'oneway') {
+              // One-way flow: use searchAnyDestination
+              const combos = await searchAnyDestination({
+                origin: airport.code,
+                dateFrom,
+                dateTo,
+                adults,
+                market: 'pl-pl'
+                ,departureFrom, departureTo
+              }, maxPrice ? Number(maxPrice) : null);
+              // MAPUJEMY na pojedyncze loty z ceną!
+              combos.forEach(c => {
+                if (Array.isArray(c.flights)) {
+                  c.flights.forEach(flight => {
+                    // sanity check: only accept fares that originate from the airport we requested
+                    if (flight.originAirport && flight.originAirport !== airport.code) {
+                      console.warn(`   ⚠️ Pominięto lot z innego lotniska (${flight.originAirport}) zamiast ${airport.code}`);
+                      return;
+                    }
+                    allResults.push({
+                      originAirport: airport.code,
+                      originName: airport.name,
+                      destination: c.destination,
+                      destinationName: c.destinationName,
+                      date: flight.date,
+                      price: flight.price,
+                      currency: flight.currency,
+                      priceInPLN: flight.priceInPLN || null
+                      , source: flight.source || 'CACHE'
+                    });
+                  });
+                }
+              });
+            } else {
+              // Round-trip flow: call searchRoundTripRange for each airport
+              const combos = await searchRoundTripRange({
+                origin: airport.code,
+                destination: destination.toUpperCase(),
+                outFrom: dateFrom,
+                outTo: dateTo,
+                stayDaysMin,
+                stayDaysMax,
+                maxPrice: maxPrice ? Number(maxPrice) : null,
+                adults,
+                allowDifferentReturnAirport: differentReturnAirport,
+                availableReturnAirports: differentReturnAirport ? countryAirports.map(a => a.code) : null,
+                oneWayCandidateMargin: aggressiveMode ? 1.5 : 1.3
+                ,departureFrom, departureTo
+                ,arrivalFrom, arrivalTo
+                ,returnArrivalFrom, returnArrivalTo
+                ,returnDepartureFrom, returnDepartureTo
+                ,departureDays, returnDays
+              });
+              // Map returned combos into allResults (round-trip combos)
+              combos.forEach(c => {
+                // ensure the combo is complete (both outbound & inbound)
+                if (!c.outbound || !c.inbound) return;
+                // ensure times and prices are present
+                if (!c.outbound.date || !c.outbound.departure || !c.inbound.date || !c.inbound.departure) return;
+                if (!c.totalPriceInPLN) return;
+                // attach origin info
+                c.originAirport = airport.code;
+                c.originName = airport.name;
+                // Ensure returnAirport/returnName exist (for country flow)
+                if (!c.returnAirport && c.inbound && c.inbound.destination) {
+                  c.returnAirport = c.inbound.destination;
+                }
+                if ((!c.returnName || c.returnName === '') && c.returnAirport) {
+                  c.returnName = airportNameByCode[c.returnAirport] || c.returnAirport || (c.inbound && c.inbound.destinationName) || '';
+                }
+                // Oznacz kombinację źródła: API jeśli obie nogi z API; CACHE jeśli obie z cache; MIXED jeśli mieszane
+                c.source = c.source || ((c.outbound?.source === 'API' && c.inbound?.source === 'API') ? 'API' : (c.outbound?.source === 'CACHE' && c.inbound?.source === 'CACHE') ? 'CACHE' : 'MIXED');
+                allResults.push(c);
+              });
+            }
           } catch (err) {
             console.error(`Błąd wyszukiwania z ${airport.code}:`, err);
           }
         }
-        console.log('📊 Łącznie zebrano:', allResults.length, 'wyników');
-        flights = allResults.sort((a, b) => (a.minPrice || Infinity) - (b.minPrice || Infinity));
-        setFlights(flights);
+        if (tripType === 'oneway') {
+          console.log('📊 Łącznie zebrano (one-way):', allResults.length, 'lotów');
+          flights = allResults.sort((a, b) => ((a.priceInPLN || a.price || Infinity) - (b.priceInPLN || b.price || Infinity)));
+          setFlights(flights);
+        } else {
+          console.log('📊 Łącznie zebrano (round-trip):', allResults.length, 'kombinacji');
+          flights = allResults.sort((a, b) => ((a.totalPriceInPLN || Infinity) - (b.totalPriceInPLN || Infinity)));
+          setFlights(flights);
+        }
         setSearchProgress({ current: countryAirports.length, total: countryAirports.length, currentAirport: '' });
         const metrics = getLastMetrics();
-        setMetrics(metrics);
+        setStoreMetrics(metrics);
       } else {
         // Oryginalna logika - pojedyncze lotnisko
         if (tripType === 'oneway') {
@@ -324,10 +586,13 @@ export default function SearchForm() {
             dateTo: dateTo,
             adults,
             maxPrice: maxPrice ? Number(maxPrice) : null
+            ,departureFrom, departureTo
+            ,arrivalFrom, arrivalTo
+            ,departureDays
           });
           setFlights(flights);
           const metrics = getLastMetrics();
-          setMetrics(metrics);
+          setStoreMetrics(metrics);
         } else {
           // round-trip - nowy algorytm z długością pobytu
           const combinations = await searchRoundTripRange({
@@ -339,6 +604,14 @@ export default function SearchForm() {
             stayDaysMax: stayDaysMax,
             maxPrice: maxPrice ? Number(maxPrice) : null, // opcjonalny filtr ceny
             adults
+            ,allowDifferentReturnAirport: differentReturnAirport
+            ,availableReturnAirports: differentReturnAirport && searchFromCountry ? countryAirports.map(a => a.code) : null
+            ,oneWayCandidateMargin: aggressiveMode ? 1.5 : 1.3
+            ,departureFrom, departureTo
+            ,arrivalFrom, arrivalTo
+            ,returnArrivalFrom, returnArrivalTo
+            ,returnDepartureFrom, returnDepartureTo
+            ,departureDays, returnDays
           });
           // Uzupełnij returnAirport i returnName jeśli nie ma (np. fallback, multi-airport)
           combinations.forEach(c => {
@@ -348,17 +621,20 @@ export default function SearchForm() {
             if ((!c.returnName || c.returnName === '') && c.returnAirport) {
               c.returnName = airportNameByCode[c.returnAirport] || c.returnAirport;
             }
+            c.source = c.source || ((c.outbound?.source === 'API' && c.inbound?.source === 'API') ? 'API' : (c.outbound?.source === 'CACHE' && c.inbound?.source === 'CACHE') ? 'CACHE' : 'MIXED');
           });
           // Wyświetl jako połączone karty (jak w Kiwi)
           setFlights(combinations); // wszystkie kombinacje
           const metrics = getLastMetrics();
-          setMetrics(metrics); // metryki z LAST_METRICS
+          setStoreMetrics(metrics); // metryki z LAST_METRICS
           flights = combinations;
         }
       } // Koniec else - pojedyncze lotnisko
 
       // Oblicz statystyki
-      const prices = flights.filter(f => f.price).map(f => f.price);
+      const prices = tripType === 'round'
+        ? flights.filter(f => f.totalPriceInPLN != null).map(f => f.totalPriceInPLN)
+        : flights.filter(f => f.price != null).map(f => f.price);
       const stats = prices.length > 0 ? {
         flights_found: flights.length,
         min_price: Math.min(...prices),
@@ -412,8 +688,32 @@ export default function SearchForm() {
     }
   };
 
+  const handleDebugPairClick = async () => {
+    // Use defaults when empty
+    const originCode = searchFromCountry && originCountry ? originCountry : origin;
+    const defOut = debugOutDate || dateFrom;
+    const defIn = debugInDate || dateTo;
+    const defReturn = debugReturnAirport || (differentReturnAirport ? '' : destination);
+    const outDate = prompt('Out date (YYYY-MM-DD):', defOut);
+    if (!outDate) return;
+    const inDate = prompt('In date (YYYY-MM-DD):', defIn);
+    if (!inDate) return;
+    const returnAirport = prompt('Return airport IATA (e.g. WAW):', defReturn || 'WAW');
+    if (!returnAirport) return;
+
+    try {
+      console.log('🔧 Debug pair:', { origin: originCode, destination, outDate, inDate, returnAirport });
+      const res = await debugCheckPair({ origin: originCode, destination: destination.toUpperCase(), outDate, inDate, returnAirport: returnAirport.toUpperCase(), adults });
+      console.log('🔍 Debug result:', res);
+      toast.success(`Debug finished: ${res.accepted.length} accepted, ${res.rejected.length} rejected. Sprawdź konsolę.`);
+    } catch (err) {
+      console.error('Błąd debugCheckPair:', err);
+      toast.error(`Błąd debugCheckPair: ${err?.message || err}`);
+    }
+  };
+
   return (
-    <div className="bg-white rounded-lg shadow-lg p-6">
+    <div className="bg-white rounded-lg shadow-lg p-6 search-form">
       <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
         <Plane className="w-6 h-6 text-blue-600" />
         Wyszukaj Loty
@@ -476,6 +776,19 @@ export default function SearchForm() {
               </div>
             </label>
           )}
+          {/* Checkbox: Aggressive FareFinder - expand candidate margin */}
+          <label className="flex items-center space-x-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={aggressiveMode}
+              onChange={(e) => setAggressiveMode(e.target.checked)}
+              className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+            />
+            <div className="flex-1">
+              <span className="text-sm font-medium text-gray-900">🔎 Aggressive FareFinder</span>
+              <p className="text-xs text-gray-600 mt-0.5">Zwiększ tolerancję marginesu przy zestawianiu kandydatów z miesięcznych cen.</p>
+            </div>
+          </label>
         </div>
 
         {/* Origin - WSZYSTKIE lotniska z bazy LUB wybór kraju */}
@@ -765,6 +1078,73 @@ export default function SearchForm() {
               className="w-1/2 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
           </div>
+            <div className="mt-2 flex gap-2 items-center">
+            <div className="flex-1">
+              <div className="flex items-center justify-between">
+                <label className="text-xs text-gray-500">Wylot</label>
+                <button type="button" onClick={() => setRangeFullDay('departure')} className="text-xs text-blue-600 hover:underline">Cały dzień</button>
+              </div>
+              <div className="text-sm text-blue-600 mt-1">{rangeLabel(departureFromMin, departureToMin)}</div>
+              {/* Removed direct time inputs - use slider for range selection */}
+              <div className="mt-2 relative" style={{ height: 36 }} onDoubleClick={() => setRangeFullDay('departure')}>
+                <div className="absolute inset-0 px-1 flex items-center">
+                  <div className="w-full h-2 rounded bg-gray-200" style={rangeTrackStyle(departureFromMin, departureToMin)} />
+                </div>
+                <input type="range" min="0" max="1439" step="1" aria-label="Wylot od" aria-valuemin={0} aria-valuemax={1439} aria-valuenow={departureFromMin} value={departureFromMin} onChange={(e) => {
+                  const v = Number(e.target.value);
+                  if (v > departureToMin) setDepartureToMin(v);
+                  setDepartureFromMin(v);
+                }} className="absolute inset-0 w-full h-9 appearance-none bg-transparent dual-range" style={{ zIndex: 2 }} />
+                <input type="range" min="0" max="1439" step="1" aria-label="Wylot do" aria-valuemin={0} aria-valuemax={1439} aria-valuenow={departureToMin} value={departureToMin} onChange={(e) => {
+                  const v = Number(e.target.value);
+                  if (v < departureFromMin) setDepartureFromMin(v);
+                  setDepartureToMin(v);
+                }} className="absolute inset-0 w-full h-9 appearance-none bg-transparent dual-range" style={{ zIndex: 3 }} />
+                {/* moved up into a more visible label */}
+              </div>
+            </div>
+            <div className="flex-1">
+              <div className="flex items-center justify-between">
+                <label className="text-xs text-gray-500">Przylot</label>
+                <button type="button" onClick={() => setRangeFullDay('arrival')} className="text-xs text-blue-600 hover:underline">Cały dzień</button>
+              </div>
+              <div className="text-sm text-blue-600 mt-1">{rangeLabel(arrivalFromMin, arrivalToMin)}</div>
+              {/* Removed direct time inputs - use slider for range selection */}
+              <div className="mt-2 relative" style={{ height: 36 }} onDoubleClick={() => setRangeFullDay('arrival')}>
+                <div className="absolute inset-0 px-1 flex items-center">
+                  <div className="w-full h-2 rounded bg-gray-200" style={rangeTrackStyle(arrivalFromMin, arrivalToMin)} />
+                </div>
+                <input type="range" min="0" max="1439" step="1" aria-label="Przylot od" aria-valuemin={0} aria-valuemax={1439} aria-valuenow={arrivalFromMin} value={arrivalFromMin} onChange={(e) => {
+                  const v = Number(e.target.value);
+                  if (v > arrivalToMin) setArrivalToMin(v);
+                  setArrivalFromMin(v);
+                }} className="absolute inset-0 w-full h-9 appearance-none bg-transparent dual-range" style={{ zIndex: 2 }} />
+                <input type="range" min="0" max="1439" step="1" aria-label="Przylot do" aria-valuemin={0} aria-valuemax={1439} aria-valuenow={arrivalToMin} value={arrivalToMin} onChange={(e) => {
+                  const v = Number(e.target.value);
+                  if (v < arrivalFromMin) setArrivalFromMin(v);
+                  setArrivalToMin(v);
+                }} className="absolute inset-0 w-full h-9 appearance-none bg-transparent dual-range" style={{ zIndex: 3 }} />
+                {/* moved up into a more visible label */}
+              </div>
+            </div>
+            {/* Days of week toggles for outbound */}
+            <div className="mt-3 w-full">
+              <label className="text-xs text-gray-500">Dni wylotu</label>
+              <div className="flex gap-2 mt-2 items-center">
+                <div className="flex gap-2 ml-4">
+                  {['P', 'W', 'S', 'C', 'P', 'S', 'N'].map((label, idx) => (
+                    <button key={`out-day-${idx}`} type="button" aria-pressed={departureDays[idx]} title={['Poniedziałek','Wtorek','Środa','Czwartek','Piątek','Sobota','Niedziela'][idx]} className={`day-selector-button rounded-full flex items-center justify-center ${departureDays[idx] ? 'active' : ''}`} onClick={() => {
+                      const newDays = [...departureDays];
+                      newDays[idx] = !newDays[idx];
+                      setDepartureDays(newDays);
+                    }}>{label}</button>
+                  ))}
+                </div>
+                {/* Using circle toggles for day-of-week selection */}
+              </div>
+            </div>
+            {/* Removed duplicate 'Wylot do' and 'Przylot do' columns to keep single dual-range pair per direction */}
+          </div>
         </div>
 
         {/* Return date range (only for round-trip) */}
@@ -849,6 +1229,78 @@ export default function SearchForm() {
           </div>
         )}
 
+        {tripType === 'round' && (
+          <div className="mt-2">
+            <div className="mt-2 flex gap-2 items-center">
+              <div className="flex-1">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs text-gray-500">Wylot powrotny</label>
+                  <button type="button" onClick={() => setRangeFullDay('returnDeparture')} className="text-xs text-blue-600 hover:underline">Cały dzień</button>
+                </div>
+                <div className="text-sm text-blue-600 mt-1">{rangeLabel(returnDepartureFromMin, returnDepartureToMin)}</div>
+                {/* Removed direct time inputs - use slider for range selection */}
+                <div className="mt-2 relative" style={{ height: 36 }} onDoubleClick={() => setRangeFullDay('returnDeparture')}>
+                  <div className="absolute inset-0 px-1 flex items-center">
+                    <div className="w-full h-2 rounded bg-gray-200" style={rangeTrackStyle(returnDepartureFromMin, returnDepartureToMin)} />
+                  </div>
+                  <input type="range" min="0" max="1439" step="1" aria-label="Powrót - wylot od" aria-valuemin={0} aria-valuemax={1439} aria-valuenow={returnDepartureFromMin} value={returnDepartureFromMin} onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (v > returnDepartureToMin) setReturnDepartureToMin(v);
+                    setReturnDepartureFromMin(v);
+                  }} className="absolute inset-0 w-full h-9 appearance-none bg-transparent dual-range" style={{ zIndex: 2 }} />
+                  <input type="range" min="0" max="1439" step="1" aria-label="Powrót - wylot do" aria-valuemin={0} aria-valuemax={1439} aria-valuenow={returnDepartureToMin} value={returnDepartureToMin} onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (v < returnDepartureFromMin) setReturnDepartureFromMin(v);
+                    setReturnDepartureToMin(v);
+                  }} className="absolute inset-0 w-full h-9 appearance-none bg-transparent dual-range" style={{ zIndex: 3 }} />
+                  {/* moved up into a more visible label */}
+                </div>
+              </div>
+              <div className="flex-1">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs text-gray-500">Przylot powrotny</label>
+                  <button type="button" onClick={() => setRangeFullDay('returnArrival')} className="text-xs text-blue-600 hover:underline">Cały dzień</button>
+                </div>
+                <div className="text-sm text-blue-600 mt-1">{rangeLabel(returnArrivalFromMin, returnArrivalToMin)}</div>
+                {/* Removed direct time inputs - use slider for range selection */}
+                <div className="mt-2 relative" style={{ height: 36 }} onDoubleClick={() => setRangeFullDay('returnArrival')}>
+                  <div className="absolute inset-0 px-1 flex items-center">
+                    <div className="w-full h-2 rounded bg-gray-200" style={rangeTrackStyle(returnArrivalFromMin, returnArrivalToMin)} />
+                  </div>
+                  <input type="range" min="0" max="1439" step="1" aria-label="Powrót - przylot od" aria-valuemin={0} aria-valuemax={1439} aria-valuenow={returnArrivalFromMin} value={returnArrivalFromMin} onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (v > returnArrivalToMin) setReturnArrivalToMin(v);
+                    setReturnArrivalFromMin(v);
+                  }} className="absolute inset-0 w-full h-9 appearance-none bg-transparent dual-range" style={{ zIndex: 2 }} />
+                  <input type="range" min="0" max="1439" step="1" aria-label="Powrót - przylot do" aria-valuemin={0} aria-valuemax={1439} aria-valuenow={returnArrivalToMin} value={returnArrivalToMin} onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (v < returnArrivalFromMin) setReturnArrivalFromMin(v);
+                    setReturnArrivalToMin(v);
+                  }} className="absolute inset-0 w-full h-9 appearance-none bg-transparent dual-range" style={{ zIndex: 3 }} />
+                  {/* moved up into a more visible label */}
+                </div>
+              </div>
+              <div className="mt-3 w-full">
+                <label className="text-xs text-gray-500">Dni powrotu</label>
+                <div className="flex gap-2 mt-2 items-center">
+                  <div className="flex items-center gap-2">
+                    <div className="flex gap-2 ml-4">
+                      {['P', 'W', 'S', 'C', 'P', 'S', 'N'].map((label, idx) => (
+                        <button key={`ret-day-${idx}`} type="button" aria-pressed={returnDays[idx]} title={['Poniedziałek','Wtorek','Środa','Czwartek','Piątek','Sobota','Niedziela'][idx]} className={`day-selector-button rounded-full flex items-center justify-center ${returnDays[idx] ? 'active' : ''}`} onClick={() => {
+                          const newDays = [...returnDays];
+                          newDays[idx] = !newDays[idx];
+                          setReturnDays(newDays);
+                        }}>{label}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {/* Using circle toggles for day-of-week selection */}
+                </div>
+            </div>
+          </div>
+        </div>
+        )}
+
         {/* Max cena (opcjonalne - optymalizacja) */}
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -870,32 +1322,9 @@ export default function SearchForm() {
           </p>
         </div>
 
-        {/* OLD Return date range - USUNIĘTE
-        {tripType === 'round' && (
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2 flex items-center gap-2">
-              <Calendar className="w-4 h-4" />
-              Zakres dat powrotu
-            </label>
-            <div className="flex gap-2">
-              <input
-                type="date"
-                value={returnFrom}
-                onChange={(e) => setReturnFrom(e.target.value)}
-                min={dateFrom || new Date().toISOString().split('T')[0]}
-                className="w-1/2 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              />
-              <input
-                type="date"
-                value={returnTo}
-                onChange={(e) => setReturnTo(e.target.value)}
-                min={returnFrom || dateFrom || new Date().toISOString().split('T')[0]}
-                className="w-1/2 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              />
-            </div>
-          </div>
-        )}
-        */}
+        {/* Confirmation removed; we do not verify prices via Search API anymore */}
+
+
 
         {/* Adults */}
         <div>
@@ -914,6 +1343,7 @@ export default function SearchForm() {
         </div>
 
         {/* Submit */}
+        <div className="flex gap-2">
         <button
           type="submit"
           disabled={
@@ -928,6 +1358,14 @@ export default function SearchForm() {
           <Search className="w-5 h-5" />
           {isSubmitting ? 'Szukam...' : 'Szukaj Lotów'}
         </button>
+        <button
+          type="button"
+          onClick={handleDebugPairClick}
+          className="bg-gray-200 text-gray-800 py-3 px-4 rounded-lg font-medium hover:bg-gray-300 flex items-center gap-2"
+        >
+          🧪 Debug pair
+        </button>
+        </div>
 
         {/* Postęp wyszukiwania z wielu lotnisk */}
         {isSubmitting && searchProgress.total > 0 && (
