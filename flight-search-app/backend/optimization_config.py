@@ -13,7 +13,7 @@ CACHE_SETTINGS = {
 # Rate limiting
 RATE_LIMIT = {
     'ENABLED': True,
-    'BASE_DELAY': 600,  # ms
+    'BASE_DELAY': 300,  # ms (szybsze domyślne)
     'JITTER_RANGE': 200,  # ±200ms
     'RETRY_DELAY': 2000,  # ms
     'MAX_RETRIES': 2,
@@ -35,7 +35,7 @@ API_OPTIMIZATION = {
     'TIMEOUT': 30,  # sekundy
     'MAX_CONNECTIONS': 100,
     'ENABLE_COMPRESSION': True,
-    'PARALLEL_REQUESTS': 3,  # Równoległe requesty (batch)
+    'PARALLEL_REQUESTS': 6,  # Równoległe requesty (batch)
 }
 
 # Search optimization

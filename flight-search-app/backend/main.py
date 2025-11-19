@@ -3,108 +3,68 @@ FastAPI Backend - Wyszukiwarka Lotów Ryanair
 Backend proxy dla Ryanair API + baza danych
 """
 from fastapi import FastAPI, Depends, HTTPException, status, Body, Response, Request, Query
+from database import get_db
+from models import *
+from schemas import *
+from auth import get_current_user, verify_password, create_access_token, get_password_hash
+
+# Simple in-memory cache used by various endpoints; durable caching may be added later
+MEMORY_CACHE = {}
 from fastapi.middleware.cors import CORSMiddleware
+import json
+import gzip
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from typing import List, Optional
+import random
+import asyncio
 from datetime import datetime, timedelta, timezone
 import os
 import httpx
 import brotli
-import json
-from dotenv import load_dotenv
 
-from database import engine, Base, get_db
-from models import (
-    User, SearchHistory, PriceAlert, FavoriteFlight, FlightCache,
-    Country, City, Airport
-)
-from schemas import (
-    UserCreate, UserLogin, UserResponse,
-    SearchHistoryCreate, SearchHistoryResponse,
-    PriceAlertCreate, PriceAlertResponse,
-    FavoriteFlightCreate, FavoriteFlightResponse,
-    Token,
-)
-from auth import (
-    get_password_hash, verify_password,
-    create_access_token, get_current_user,
-)
-
-# ============================================
-# App initialization, DB, CORS, helpers
-# ============================================
-
-# Load environment
-load_dotenv()
-
-# FastAPI app
-app = FastAPI(title="Flight Search API", version="1.0.0")
-
-# Create DB tables if missing
-try:
-    Base.metadata.create_all(bind=engine)
-except Exception:
-    # Non-fatal at startup; DB might be managed externally
-    pass
-
-# CORS setup
-cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000,http://localhost:3001").split(",")
+# Initialize FastAPI app instance and basic middleware
+app = FastAPI()
+# Configure CORS to allow local frontend dev servers
+FRONTEND_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in cors_origins if o.strip()],
+    allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Simple in-memory cache (fallback to DB cache when needed)
-MEMORY_CACHE: dict = {}
 
-
-def decode_response_content(response: httpx.Response):
-    """Best-effort JSON decoder with Brotli fallback.
-
-    Tries response.json(), then attempts to decompress Brotli if necessary,
-    and finally falls back to parsing response.text.
-    """
-    # 1) Try native json()
+@app.on_event("startup")
+async def on_startup():
+    # Fetch exchange rates on startup and schedule periodic refresh
     try:
-        return response.json()
-    except Exception:
-        pass
+        await fetch_exchange_rates()
+    except Exception as e:
+        print(f"⚠️ NBP rates fetch on startup failed: {e}")
 
-    content = response.content or b""
-    if not content:
-        return {}
+    async def _periodic_rates_refresh():
+        while True:
+            try:
+                await asyncio.sleep(24 * 60 * 60)  # 24 hours
+                await fetch_exchange_rates()
+            except Exception as e:
+                print(f"⚠️ periodic NBP refresh error: {e}")
+                await asyncio.sleep(60 * 60)  # retry in 1 hour
 
-    enc = (response.headers.get("Content-Encoding", "") or "").lower()
-    ctype = (response.headers.get("Content-Type", "") or "").lower()
+    # Schedule the periodic refresher
+    asyncio.create_task(_periodic_rates_refresh())
 
-    # 2) Try Brotli explicitly (some endpoints return raw br stream)
-    if "br" in enc or ("application/json" in ctype and content[:1] not in (b"{", b"[")):
-        try:
-            txt = brotli.decompress(content).decode("utf-8", errors="ignore")
-            return json.loads(txt)
-        except Exception:
-            pass
-
-    # 3) Final fallback: parse text as JSON
-    try:
-        return json.loads(response.text)
-    except Exception:
-        return {}
 @app.get("/api/ryanair/routes")
-async def get_routes_from_airport(origin: str, market: str = "pl-pl"):
+async def get_routes(origin: str = Query(..., alias="origin"), market: str = Query("pl-pl", alias="market")):
     """
-    Zwraca listę dostępnych destynacji z danego lotniska WYŁĄCZNIE na podstawie publicznych
-    endpointów "locate" (bez szukania cen/fare'ów).
-
-    Strategia:
-    - pobierz listę lotnisk z routes (locate v5 airports {lang}/active → {lang} → en/active)
-    - znajdź wpis dla origin i wyciągnij tylko wpisy 'airport:XXX'
+    Zwraca listę destynacji (kody IATA) z lotniska używając publicznego endpointu LOCATE.
     - jeśli brak tras dla origin (np. WAW), spróbuj lotnisk w tym samym mieście (cityCode/macCity)
-      i użyj pierwszego, które ma trasy (np. WMI dla Warszawy)
     - wynik cache'owany 12h
     """
     from datetime import datetime, timedelta
@@ -150,7 +110,7 @@ async def get_routes_from_airport(origin: str, market: str = "pl-pl"):
             for u in urls:
                 try:
                     print(f"🔎 LOCATE fetch: {u}")
-                    r = await client.get(u, headers=headers)
+                    r = await safe_get(client, u, headers=headers)
                     if r.status_code == 200:
                         airports_data = decode_response_content(r)
                         if isinstance(airports_data, list) and len(airports_data) > 0:
@@ -234,7 +194,7 @@ async def get_routes_from_airport(origin: str, market: str = "pl-pl"):
                         sw_url = f"https://www.ryanair.com/api/views/locate/searchWidget/routes/{lang}/airport/{origin}"
                         print(f"   → {sw_url}")
                         try:
-                            sw_r = await client.get(sw_url, headers=headers)
+                            sw_r = await safe_get(client, sw_url, headers=headers)
                             if sw_r.status_code == 200:
                                 sw_data = decode_response_content(sw_r)
                                 cands = [sw_data] if isinstance(sw_data, dict) else (sw_data or [])
@@ -283,6 +243,221 @@ async def get_routes_from_airport(origin: str, market: str = "pl-pl"):
     except Exception as e:
         print(f"❌ Błąd pobierania połączeń: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Błąd pobierania połączeń: {str(e)}")
+
+
+# Helper: decode HTTPX response content with common encodings
+def decode_response_content(resp):
+    try:
+        # Prefer httpx Response.json() which handles decoding
+        return resp.json()
+    except Exception:
+        try:
+            content = resp.content
+            # Try brotli
+            try:
+                import brotli as _brotli
+                content = _brotli.decompress(content)
+            except Exception:
+                pass
+            # Try gzip
+            try:
+                content = gzip.decompress(content)
+            except Exception:
+                pass
+            # Fallback to text
+            text = content.decode('utf-8', errors='ignore') if isinstance(content, (bytes, bytearray)) else str(content)
+            return json.loads(text) if text else None
+        except Exception:
+            return None
+
+
+# Exchange rates storage (NBP)
+EXCHANGE_RATES = {
+        'PLN': 1,
+        'EUR': 4.35,
+        'GBP': 5.15,
+        'USD': 4.05,
+        'CZK': 0.18,
+        'HUF': 0.011,
+        'SEK': 0.39,
+        'NOK': 0.38,
+        'DKK': 0.58
+    }
+
+
+async def fetch_exchange_rates():
+        """Fetch rates from NBP and update EXCHANGE_RATES dict."""
+        url = 'http://api.nbp.pl/api/exchangerates/tables/A?format=json'
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await safe_get(client, url)
+                if r.status_code == 200:
+                    data = decode_response_content(r)
+                    if isinstance(data, list) and len(data) > 0:
+                        rates = data[0].get('rates', [])
+                        new_rates = {'PLN': 1}
+                        for rr in rates:
+                            code = rr.get('code')
+                            mid = rr.get('mid')
+                            if code and mid:
+                                new_rates[code] = float(mid)
+                        global EXCHANGE_RATES
+                        EXCHANGE_RATES = new_rates
+                        print(f"✅ NBP rates updated: {list(EXCHANGE_RATES.keys())}")
+                        return
+        except Exception as e:
+            print(f"⚠️ NBP fetch failed: {e}")
+        print("⚠️ Using fallback exchange rates")
+
+
+def convert_to_pln(amount, currency):
+        """Convert a numeric amount in given currency to PLN using EXCHANGE_RATES."""
+        try:
+            if amount is None:
+                return None
+            if isinstance(amount, str) and amount.strip() == '':
+                return None
+            val = float(amount)
+            if val == 0:
+                return 0
+            rate = EXCHANGE_RATES.get((currency or '').upper(), None)
+            if rate is None:
+                # Try to refresh rates once if missing
+                return round(val * 1.0, 2)
+            return round(val * rate, 2)
+        except Exception:
+            return None
+
+
+# User-Agent rotation list
+USER_AGENTS = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0'
+    ]
+
+
+async def safe_get(client: httpx.AsyncClient, url: str, params: dict = None, headers: dict = None, max_retries: int = 3):
+        """Wrapper for client.get with jitter/throttling, UA rotation, and retry on 429/503."""
+        attempt = 0
+        while attempt <= max_retries:
+            attempt += 1
+            # Soft delay (throttle)
+            await asyncio.sleep(random.uniform(0.2, 0.5))
+            # Build headers with UA rotation
+            h = dict(headers or {})
+            h['User-Agent'] = random.choice(USER_AGENTS)
+            h['Accept-Encoding'] = 'gzip, deflate, br'
+            try:
+                r = await client.get(url, params=params, headers=h)
+                # Rate-limit hits
+                if r.status_code in (429, 503, 502):
+                    backoff = 1.0 * (2 ** (attempt - 1))
+                    print(f"⚠️ Received {r.status_code} from {url}. Backing off {backoff}s (attempt {attempt})")
+                    await asyncio.sleep(backoff)
+                    continue
+                return r
+            except httpx.RequestError as e:
+                print(f"⚠️ HTTP request error {e} (attempt {attempt}) for {url}")
+                await asyncio.sleep(0.5 * attempt)
+                continue
+        # Last attempt
+        return await client.get(url, params=params, headers=headers or {})
+
+
+
+# Helper: robustly extract a numeric price and currency from FareFinder/Search API price objects
+import re
+def extract_price_value(price_obj):
+        try:
+            if isinstance(price_obj, dict):
+                # Common names
+                for k in ("value", "amount", "valueMainUnit", "rawAmount"):
+                    if price_obj.get(k) is not None:
+                        return float(price_obj.get(k))
+                # Some payloads use nested structures - try 'total' or 'price'
+                if price_obj.get('total') is not None:
+                    return float(price_obj.get('total'))
+            elif isinstance(price_obj, (int, float)):
+                return float(price_obj)
+            elif isinstance(price_obj, str):
+                # Try to extract value= or amount=
+                m = re.search(r"value=([0-9]+(?:\.[0-9]+)?)", price_obj)
+                if m:
+                    return float(m.group(1))
+                m2 = re.search(r"amount=([0-9]+(?:\.[0-9]+)?)", price_obj)
+                if m2:
+                    return float(m2.group(1))
+                # last resort - find any number like 123.45
+                m3 = re.search(r"([0-9]+(?:\.[0-9]+)?)", price_obj)
+                if m3:
+                    return float(m3.group(1))
+        except Exception:
+            pass
+        return None
+
+
+def extract_currency(price_obj):
+        try:
+            if isinstance(price_obj, dict):
+                for k in ("currencyCode", "currency", "currencyCodeIso", "currencyIso"):
+                    if price_obj.get(k):
+                        return price_obj.get(k)
+            elif isinstance(price_obj, str):
+                m = re.search(r"currency(?:Code)?=([A-Z]{3})", price_obj)
+                if m:
+                    return m.group(1)
+                # sometimes currency appears as PLN or EUR alone
+                m2 = re.search(r"\b(PLN|EUR|GBP|USD|CZK|HUF|SEK|NOK|DKK)\b", price_obj)
+                if m2:
+                    return m2.group(1)
+        except Exception:
+            pass
+        return None
+
+
+def normalize_price_obj(price_obj):
+        value = extract_price_value(price_obj)
+        currency = extract_currency(price_obj) or 'PLN'
+        return { 'value': value, 'currencyCode': currency }
+
+
+def ensure_fare_prices(fare):
+    """Ensure outbound/inbound price objects exist and have priceInPLN populated."""
+    try:
+        # Outbound
+        out = fare.get('outbound') or {}
+        out_price = out.get('price') or {}
+        if not isinstance(out_price, dict):
+            out_price = normalize_price_obj(out_price)
+        if out_price.get('currencyCode') is None:
+            out_price['currencyCode'] = extract_currency(out_price) or 'PLN'
+        out_price['priceInPLN'] = convert_to_pln(out_price.get('value'), out_price.get('currencyCode'))
+        out['price'] = out_price
+        fare['outbound'] = out
+    except Exception:
+        pass
+    try:
+        # Inbound
+        inbound = fare.get('inbound') or {}
+        in_price = inbound.get('price') or {}
+        if not isinstance(in_price, dict):
+            in_price = normalize_price_obj(in_price)
+        if in_price.get('currencyCode') is None:
+            in_price['currencyCode'] = extract_currency(in_price) or 'PLN'
+        in_price['priceInPLN'] = convert_to_pln(in_price.get('value'), in_price.get('currencyCode'))
+        inbound['price'] = in_price
+        fare['inbound'] = inbound
+    except Exception:
+        pass
+    # total for roundtrip
+    try:
+        t = (fare.get('outbound', {}).get('price', {}).get('priceInPLN') or 0) + (fare.get('inbound', {}).get('price', {}).get('priceInPLN') or 0)
+        fare['totalPriceInPLN'] = round(t, 2) if t else None
+    except Exception:
+        fare['totalPriceInPLN'] = None
+    return fare
 
 
 # ============================================
@@ -346,7 +521,7 @@ async def get_available_dates(origin: str, destination: str, market: str = "pl-p
         print(f"📅 Pobieram dostępne daty dla {origin}→{destination}...")
 
         async with httpx.AsyncClient(timeout=15.0, http2=True) as client:
-            response = await client.get(url, headers=headers)
+            response = await safe_get(client, url, headers=headers)
 
             if response.status_code != 200:
                 print(f"⚠️ AvailDates status: {response.status_code}")
@@ -419,7 +594,8 @@ async def search_roundtrip_fares(
     durationTo: int = 7,
     adultPaxCount: int = 1,
     market: str = "pl-pl",
-    searchMode: str = "ALL"
+    searchMode: str = "ALL",
+    # 'confirm' parameter removed - no Search API confirmation anymore
 ):
     """
     Round-Trip FareFinder API - zwraca najtańsze kombinacje lotów tam i z powrotem
@@ -466,16 +642,23 @@ async def search_roundtrip_fares(
 
         async with httpx.AsyncClient(timeout=30.0, http2=True) as client:
             # Najpierw odwiedź stronę główną (ustanów sesję)
-            await client.get("https://www.ryanair.com/pl/pl", headers=headers)
+            await safe_get(client, "https://www.ryanair.com/pl/pl", headers=headers)
 
             # Teraz wywołaj FareFinder
-            response = await client.get(url, params=params, headers=headers)
+            response = await safe_get(client, url, params=params, headers=headers)
 
             print(f"Status code: {response.status_code}")
 
             if response.status_code == 200:
                 data = decode_response_content(response)
                 print(f"📊 Otrzymano ceny dla {len(data.get('fares', []))} kombinacji round-trip")
+
+                # Search API confirmation removed — return FareFinder data as received, normalized
+
+                # Normalize price objects to include PLN conversion
+                if isinstance(data.get('fares'), list):
+                    for i, f in enumerate(data.get('fares')):
+                        data['fares'][i] = ensure_fare_prices(f)
                 return data
             else:
                 print(f"Błąd RoundTrip FareFinder response: {response.text}")
@@ -549,10 +732,10 @@ async def search_flights(
 
         async with httpx.AsyncClient(timeout=30.0, http2=True) as client:
             # Najpierw odwiedź stronę główną
-            await client.get("https://www.ryanair.com/pl/pl", headers=headers)
+            await safe_get(client, "https://www.ryanair.com/pl/pl", headers=headers)
 
             # Wywołaj Search API
-            response = await client.get(url, params=params, headers=headers)
+            response = await safe_get(client, url, params=params, headers=headers)
 
             print(f"Status code: {response.status_code}")
 
@@ -588,7 +771,8 @@ async def search_oneway_fares(
     outboundDepartureTimeTo: str,
     adultPaxCount: int = 1,
     market: str = "pl-pl",
-    searchMode: str = "ALL"
+    searchMode: str = "ALL",
+    # 'confirm' parameter removed per user request
 ):
     """
     OneWay FareFinder API - zwraca najtańsze ceny dla lotów w jedną stronę
@@ -633,13 +817,18 @@ async def search_oneway_fares(
             await client.get("https://www.ryanair.com/pl/pl", headers=headers)
 
             # Teraz wywołaj OneWay FareFinder
-            response = await client.get(url, params=params, headers=headers)
+            response = await safe_get(client, url, params=params, headers=headers)
 
             print(f"Status code: {response.status_code}")
 
             if response.status_code == 200:
                 data = decode_response_content(response)
                 print(f"📊 Otrzymano ceny dla {len(data.get('fares', []))} lotów jednokierunkowych")
+                # Confirmation via Search API is removed. We normalize and return all fares instead.
+                # Normalize prices for non-confirmed results
+                if isinstance(data.get('fares'), list):
+                    for i, f in enumerate(data.get('fares')):
+                        data['fares'][i] = ensure_fare_prices(f)
                 return data
             else:
                 print(f"Błąd OneWay FareFinder response: {response.text}")
@@ -1386,7 +1575,10 @@ async def search_any_destination(
     outboundDepartureDateTo: str = Query(..., alias="outboundDepartureDateTo"),
     adultPaxCount: int = Query(1, alias="adultPaxCount"),
     market: str = Query("pl-pl", alias="market"),
-    searchMode: str = Query("ALL", alias="searchMode")
+    searchMode: str = Query("ALL", alias="searchMode"),
+    # 'confirm' parameter removed per user request
+    minPrice: Optional[float] = Query(None, alias='minPrice'),
+    maxPrice: Optional[float] = Query(None, alias='maxPrice')
 ):
     """
     Wyszukaj loty z danego lotniska do dowolnego kierunku (ANY destination)
@@ -1401,15 +1593,145 @@ async def search_any_destination(
         "market": market,
         "searchMode": searchMode
     }
+    """
+    Wyszukaj loty z danego lotniska do dowolnego kierunku (ANY destination)
+    """
     url = f"https://www.ryanair.com/api/farfnd/3/oneWayFares"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(url, params=params)
+            # Helper to filter fares and optionally confirm availability/price
+            import asyncio
+            sem = asyncio.Semaphore(5)
+            async def check_fare(fare, allowed=None):
+                """Lightweight check: apply filters and normalize prices; no Search API confirmation."""
+                async with sem:
+                    outbound = fare.get('outbound') or {}
+                    dest = (outbound.get('arrivalAirport') or {}).get('iataCode') or (outbound.get('arrivalAirport') or {}).get('code') or ''
+                    dest = (dest or '').upper()
+                    price_obj = outbound.get('price')
+                    price = None
+                    try:
+                        # Try to parse numeric amounts
+                        if isinstance(price_obj, dict):
+                            price = price_obj.get('value') or price_obj.get('amount')
+                        elif isinstance(price_obj, (int, float)):
+                            price = price_obj
+                        elif isinstance(price_obj, str):
+                            import re
+                            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", price_obj)
+                            if m:
+                                price = float(m.group(1))
+                    except Exception:
+                        price = None
+                    if price is None or price == 0:
+                        return None
+                    # Normalize and convert price to PLN and compare against minPrice (PLN)
+                    try:
+                        fare = ensure_fare_prices(fare)
+                        price_pln = fare.get('outbound', {}).get('price', {}).get('priceInPLN')
+                        if (price_pln is None) and isinstance(price, (int, float)):
+                            # fallback: convert using currency from price_obj
+                            currency = (price_obj.get('currencyCode') if isinstance(price_obj, dict) else None) or (price_obj.get('currency') if isinstance(price_obj, dict) else None) or 'PLN'
+                            price_pln = convert_to_pln(price, currency)
+                    except Exception:
+                        price_pln = None
+                    if minPrice is not None:
+                        try:
+                            if price_pln is None or float(price_pln) < float(minPrice):
+                                return None
+                        except Exception:
+                            return None
+                    if maxPrice is not None:
+                        try:
+                            if price_pln is None or float(price_pln) > float(maxPrice):
+                                return None
+                        except Exception:
+                            return None
+                    if allowed is not None and dest not in allowed:
+                        return None
+                    return fare
+
+
+            response = await safe_get(client, url, params=params)
             response.raise_for_status()
             data = response.json()
             # Jeśli są wyniki, zwróć je od razu
             if data.get("fares"):
-                return data
+                # Pobierz listę realnych tras dla origin (locate) - aby przefiltrować nierealne destynacje
+                lang = (market.split('-')[0] or 'pl').lower()
+                locate_url = f"https://www.ryanair.com/api/views/locate/3/airports/{lang}/active"
+                try:
+                    lr = await safe_get(client, locate_url)
+                    lr.raise_for_status()
+                    airports_data = decode_response_content(lr)
+                    def ai_code(a):
+                        return (a.get('iataCode') or a.get('code') or '').upper()
+                    def extract_routes(a):
+                        out = []
+                        for r in (a.get('routes') or []):
+                            if isinstance(r, str) and r.startswith('airport:'):
+                                code = r.split(':',1)[1].strip().upper()
+                                if len(code) == 3:
+                                    out.append(code)
+                        return out
+                    allowed = set()
+                    if isinstance(airports_data, list):
+                        origin_entry = next((a for a in airports_data if ai_code(a) == departureAirportIataCode.upper()), None)
+                        if origin_entry:
+                            allowed.update(extract_routes(origin_entry))
+                except Exception:
+                    allowed = None
+
+                fares = data.get('fares') or []
+                # filtruj i opcjonalnie potwierdzaj
+                import asyncio
+                sem = asyncio.Semaphore(5)
+                async def check_fare(fare, allowed=None):
+                    async with sem:
+                        outbound = fare.get('outbound') or {}
+                        dest = (outbound.get('arrivalAirport') or {}).get('iataCode') or (outbound.get('arrivalAirport') or {}).get('code') or ''
+                        dest = (dest or '').upper()
+                        price_obj = outbound.get('price')
+                        price = None
+                        if isinstance(price_obj, dict):
+                            price = price_obj.get('value')
+                        elif isinstance(price_obj, (int, float)):
+                            price = price_obj
+                        if price is None or price == 0:
+                            return None
+                        # Normalize and convert price to PLN and compare against minPrice (PLN)
+                        try:
+                            fare = ensure_fare_prices(fare)
+                            price_pln = fare.get('outbound', {}).get('price', {}).get('priceInPLN')
+                            if (price_pln is None) and isinstance(price, (int, float)):
+                                currency = (price_obj.get('currencyCode') if isinstance(price_obj, dict) else None) or (price_obj.get('currency') if isinstance(price_obj, dict) else None) or 'PLN'
+                                price_pln = convert_to_pln(price, currency)
+                        except Exception:
+                            price_pln = None
+                        # Filter against minPrice (lower bound) and maxPrice (upper bound)
+                        if minPrice is not None:
+                            try:
+                                if price_pln is None or float(price_pln) < float(minPrice):
+                                    return None
+                            except Exception:
+                                return None
+                        if maxPrice is not None:
+                            try:
+                                if price_pln is None or float(price_pln) > float(maxPrice):
+                                    return None
+                            except Exception:
+                                return None
+                        if allowed is not None and dest not in allowed:
+                            return None
+                        # No Search API confirmation: normalize price and return fare
+                        return fare
+                        # No Search API confirmation here - keep fare as-is after normalization
+
+                tasks = [check_fare(f) for f in fares]
+                results = await asyncio.gather(*tasks)
+                # Confirmation removed: return all normalized fares
+                filtered = [r for r in results if r]
+                return {'fares': filtered}
             # Fallback: jeśli brak wyników, spróbuj iterować po wszystkich destynacjach
             print("⚠️ Brak wyników dla ANY, fallback na iterację po destynacjach")
 
@@ -1418,7 +1740,7 @@ async def search_any_destination(
             locate_url = f"https://www.ryanair.com/api/views/locate/3/airports/{lang}/active"
             try:
                 print(f"🔎 Pobieram realne trasy z {locate_url}")
-                resp = await client.get(locate_url)
+                resp = await safe_get(client, locate_url)
                 resp.raise_for_status()
                 airports_data = decode_response_content(resp)
             except Exception as e:
@@ -1459,19 +1781,25 @@ async def search_any_destination(
                     params2 = params.copy()
                     params2["arrivalAirportIataCode"] = dest
                     try:
-                        fare_resp = await client.get(url, params=params2)
+                        fare_resp = await safe_get(client, url, params=params2)
                         fare_resp.raise_for_status()
                         fare_data = fare_resp.json()
                         if fare_data.get("fares"):
                             return fare_data["fares"]
                     except Exception as e:
                         print(f"❌ Błąd pobierania fare dla {dest}: {e}")
+                    # If FareFinder returned no fares, we do not fall back to Search API; just return empty
                     return []
             tasks = [fetch_fare(dest) for dest in destinations]
             results = await asyncio.gather(*tasks)
             for fares_list in results:
                 fares.extend(fares_list)
-            return {"fares": fares}
+            # Apply same filtering/confirmation on fallback results
+            check_tasks = [check_fare(f, allowed=destinations) for f in fares]
+            check_results = await asyncio.gather(*check_tasks)
+            # Confirmation removed - return all valid fares
+            filtered = [r for r in check_results if r]
+            return {"fares": filtered}
     except Exception as e:
         print(f"❌ Błąd search_any_destination: {e}")
         raise HTTPException(status_code=500, detail=f"Błąd wyszukiwania: {e}")
@@ -1551,6 +1879,48 @@ def save_cache(
     return {"status": "saved", "cache_key": cache_key, "expires_at": expires_at.isoformat()}
 
 
+@app.get("/api/cache/{cache_key}")
+def get_cache(cache_key: str, request: Request, response: Response, db: Session = Depends(get_db)):
+    """Pobierz wpis z cache po kluczu (dla frontendu)"""
+    origin = request.headers.get("origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    # Najpierw DB
+    try:
+        cache_entry = db.query(FlightCache).filter(FlightCache.cache_key == cache_key).first()
+        if cache_entry:
+            now = datetime.now(timezone.utc)
+            created = cache_entry.created_at or now
+            age_seconds = int((now - created).total_seconds())
+            return {
+                "data": cache_entry.data,
+                "expires_at": cache_entry.expires_at,
+                "created_at": created.isoformat(),
+                "age_seconds": age_seconds
+            }
+    except Exception:
+        pass
+    # Potem pamięć
+    mem = MEMORY_CACHE.get(cache_key)
+    if mem:
+        try:
+            now = datetime.now(timezone.utc)
+            created = mem.get("created_at") or now
+            if isinstance(created, str):
+                # If stored as isoformat string
+                try:
+                    from datetime import datetime as _dt
+                    created = _dt.fromisoformat(created)
+                except Exception:
+                    created = now
+            age_seconds = int((now - created).total_seconds())
+        except Exception:
+            age_seconds = 0
+        return {"data": mem["data"], "expires_at": mem["expires_at"], "created_at": mem.get("created_at"), "age_seconds": age_seconds}
+    raise HTTPException(status_code=404, detail="Cache entry not found")
+
 @app.delete("/api/cache/{cache_key}")
 def delete_cache(
     cache_key: str,
@@ -1608,6 +1978,79 @@ def clear_expired_cache(request: Request, response: Response, db: Session = Depe
         deleted_count += 1
 
     return {"status": "cleared", "deleted_count": deleted_count}
+
+
+@app.delete("/api/cache/prefix/{prefix}")
+def delete_cache_prefix(prefix: str, request: Request, response: Response, db: Session = Depends(get_db)):
+    """Usuń wszystkie wpisy cache zaczynające się od podanego prefixu.
+    Zabezpieczone przez nagłówek X-Admin-Secret.
+    Używaj ostrożnie — przydatne do czyszczenia cache dev/qa.
+    """
+    origin = request.headers.get("origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+
+    token = request.headers.get("X-Admin-Secret")
+    expected = os.environ.get("CACHE_ADMIN_SECRET")
+    if not expected:
+        # Default dev token
+        expected = 'dev-secret'
+
+    if token != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized: X-Admin-Secret missing or invalid")
+
+    deleted = 0
+    try:
+        q = db.query(FlightCache).filter(FlightCache.cache_key.like(f"{prefix}%"))
+        deleted += q.delete(synchronize_session=False)
+        db.commit()
+    except Exception as e:
+        print(f"⚠️ Error deleting DB cache prefix={prefix}: {e}")
+        db.rollback()
+
+    # clear memory cache keys
+    mem_keys = [k for k in list(MEMORY_CACHE.keys()) if k.startswith(prefix)]
+    for k in mem_keys:
+        del MEMORY_CACHE[k]
+        deleted += 1
+
+    print(f"[CACHE][DELETE_PREFIX] prefix={prefix} deleted_count={deleted}")
+    return {"status": "deleted", "deleted_count": deleted}
+
+
+@app.get("/api/cache/dev/clear_ryanair")
+def clear_ryanair_cache_dev(request: Request, response: Response, db: Session = Depends(get_db)):
+    """Dev-only endpoint: Clear all cache keys that start with 'ryanair_'.
+    Allowed only from loopback addresses to reduce accidental exposure.
+    """
+    origin = request.headers.get("origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    client_ip = request.client.host if request.client else None
+    if client_ip not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="Forbidden - dev endpoint only accessible locally")
+
+    prefix = "ryanair_"
+    deleted = 0
+    try:
+        q = db.query(FlightCache).filter(FlightCache.cache_key.like(f"{prefix}%"))
+        deleted += q.delete(synchronize_session=False)
+        db.commit()
+    except Exception as e:
+        print(f"⚠️ Error deleting DB cache prefix={prefix}: {e}")
+        db.rollback()
+
+    mem_keys = [k for k in list(MEMORY_CACHE.keys()) if k.startswith(prefix)]
+    for k in mem_keys:
+        del MEMORY_CACHE[k]
+        deleted += 1
+
+    print(f"[CACHE][DEV_DELETE] prefix={prefix} deleted_count={deleted}")
+    return {"status": "deleted", "deleted_count": deleted}
 
 
 # ============================================
